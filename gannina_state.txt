@@ -1,0 +1,33 @@
+======================================================================
+GANNINA OPTIMIZATION STATE - READ THIS FIRST IN NEW CONVERSATION
+======================================================================
+PHASE: 0 - SCALAR BASELINE
+CYCLES: 147734
+TARGET: <1487 cycles
+
+NEXT_ACTION: Implement VECTORIZATION in build_kernel
+
+FAILED_ATTEMPTS:
+- VLIW packing alone FAILED (dependencies)
+
+VECTORIZATION_RECIPE:
+1. Alloc vector scratch: vec_idx, vec_val, vec_node, vec_addr, vec_tmp1/2/3 (VLEN=8)
+2. vbroadcast constants: vec_zero, vec_one, vec_two, vec_forest_p, vec_n_nodes
+3. Loop: for round in rounds: for vi in range(0, batch_size, 8):
+   - vload vec_idx from inp_indices_p+vi
+   - vload vec_val from inp_values_p+vi
+   - valu('+', vec_addr, vec_forest_p, vec_idx)
+   - GATHER: 8x load_offset(vec_node, vec_addr, j) for j=0..7
+   - valu('^', vec_val, vec_val, vec_node)
+   - 6 hash stages with valu (need vbroadcast hash constants)
+   - valu('%',tmp,val,2), valu('==',tmp,tmp,0), vselect
+   - valu('*',idx,idx,2), valu('+',idx,idx,tmp3)
+   - valu('<',tmp,idx,n_nodes), vselect wrap
+   - vstore results
+
+KEY_TRAPS:
+- vbroadcast(dest, src): src is SCALAR address
+- vload/vstore: addr param is SCALAR base address
+- load_offset(dest, addr, j): for gather, dest[j]=mem[addr[j]]
+- Hash constants need vbroadcast to vectors first
+======================================================================

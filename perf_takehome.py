@@ -18,38 +18,35 @@ We recommend you look through problem.py next.
 ================================================================================
 GANNINA_OPTIMIZATION_LOG (DO NOT DELETE - PERSISTENT STATE FOR NEXT CONVERSATION)
 ================================================================================
-PHASE: 0 - SCALAR BASELINE
-CYCLES: 147734
-TARGET: <1487 cycles (100x speedup needed)
+PHASE: 1 - VECTORIZATION COMPLETE (22094 cycles)
+SPEEDUP: 6.69x over baseline
+TARGET: <1487 cycles
 
-FAILED_ATTEMPTS:
-- VLIW packing alone FAILED: dependencies between alu->load prevent parallel exec
-- Example: alu(tmp_addr=p+i) then load(x=mem[tmp_addr]) - load reads OLD tmp_addr
+CURRENT_ANALYSIS:
+  22016 instrs, 22094 cycles => NO VLIW parallelism (1:1 ratio)
+  Per vec_iter (512 total): load=10, valu=25, flow=2, alu=4, store=2
 
-ARCHITECTURE_KEY_FACTS:
-- SLOT_LIMITS: alu=12, valu=6, load=2, store=2, flow=1 per cycle
-- VLEN=8 (vector length)
-- VLIW: all reads happen BEFORE all writes in same cycle
+SLOT_LIMITS: alu=12, valu=6, load=2, store=2, flow=1
 
-NEXT_STEP: VECTORIZATION (Phase 1)
-- Replace scalar loop with vector loop processing 8 elements at once
-- 16 rounds * 32 vector_iters = 512 total vector iterations
-- Expected cycles: ~2048 (then apply VLIW packing for further gains)
+THEORETICAL_MINIMUM (naive VLIW):
+  load: 10/2 = 5 cycles/iter
+  valu: 25/6 = 5 cycles/iter  
+  flow: 2/1 = 2 cycles/iter
+  MINIMUM = 512 * 5 = 2560 cycles (load-bound)
 
-VECTORIZATION_TRAPS:
-- TRAP1: vbroadcast(dest, src) - src must be SCALAR address
-- TRAP2: load_offset(dest, addr, j) => scratch[dest+j] = mem[scratch[addr+j]]
-- TRAP3: vload/vstore addr parameter is SCALAR (base address)
-- TRAP4: Hash constants need vbroadcast to vector first
-- TRAP5: For gather, use 8x load_offset, NOT vload (vload is contiguous only)
+CRITICAL_PROBLEM: TARGET 1487 < THEORETICAL_MIN 2560 !!!
+  Must reduce TOTAL WORK, not just pack better!
 
-VECTOR_INSTRUCTION_REFERENCE:
-- ('valu', ('vbroadcast', vec_dest, scalar_src)) - broadcast scalar to vector
-- ('valu', (op, vec_dest, vec_a, vec_b)) - element-wise vector op
-- ('load', ('vload', vec_dest, scalar_addr)) - load 8 contiguous elements
-- ('load', ('load_offset', dest, addr, j)) - dest[j] = mem[addr[j]] (for gather)
-- ('store', ('vstore', scalar_addr, vec_src)) - store 8 contiguous elements
-- ('flow', ('vselect', vec_dest, vec_cond, vec_a, vec_b)) - vector select
+BREAKTHROUGH_STRATEGIES:
+  1. SOFTWARE_PIPELINING: Overlap iter[i].store with iter[i+1].load
+     - Reduces effective cycles/iter by hiding latency
+  2. LOOP_UNROLLING: Process 2+ vec_iters together
+     - Reuse constants, reduce loop overhead
+     - More slots available for parallel scheduling
+  3. REDUCE_GATHER_OPS: 8 load_offset = 8 loads = 4 cycles minimum
+     - Can we restructure data layout? NO (frozen tests)
+     - Can we cache forest values? Limited scratch space
+  4. HASH_OPTIMIZATION: 18 valu ops for hash, could interleave with loads
 ================================================================================
 """
 
@@ -75,15 +72,6 @@ from problem import (
 
 
 class KernelBuilder:
-    """
-    GANNINA_STATE: PHASE 0 - SCALAR BASELINE (147734 cycles)
-    GANNINA_NEXT: Implement vectorization in build_kernel
-    GANNINA_TRAPS:
-    - vbroadcast needs SCALAR src address
-    - load_offset for gather: dest[j]=mem[addr[j]]
-    - vload/vstore addr is SCALAR base
-    - Hash constants need vbroadcast first
-    """
     def __init__(self):
         self.instrs = []
         self.scratch = {}
@@ -94,14 +82,210 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
+    def get_slot_deps(self, engine, slot):
+        """Extract (writes, reads) sets for a slot. Returns sets of (addr, lane) tuples."""
+        writes = set()
+        reads = set()
+        
+        if engine == "debug":
+            return writes, reads
+        
+        if engine in ("alu", "valu"):
+            op, dest, src1, src2 = slot
+            if engine == "valu" and op == "vbroadcast":
+                # vbroadcast: writes dest[0:VLEN], reads src1 (scalar)
+                for j in range(VLEN):
+                    writes.add((dest, j))
+                reads.add((src1, 0))
+            elif engine == "valu":
+                # Vector ops: read/write all VLEN lanes
+                for j in range(VLEN):
+                    writes.add((dest, j))
+                    reads.add((src1, j))
+                    reads.add((src2, j))
+            else:
+                # Scalar ALU
+                writes.add((dest, 0))
+                reads.add((src1, 0))
+                reads.add((src2, 0))
+        
+        elif engine == "load":
+            op = slot[0]
+            if op == "const":
+                # const: writes dest, no reads
+                _, dest, val = slot
+                writes.add((dest, 0))
+            elif op == "load":
+                # load: writes dest, reads addr
+                _, dest, addr = slot
+                writes.add((dest, 0))
+                reads.add((addr, 0))
+            elif op == "vload":
+                # vload: writes dest[0:VLEN], reads addr (scalar)
+                _, dest, addr = slot
+                for j in range(VLEN):
+                    writes.add((dest, j))
+                reads.add((addr, 0))
+            elif op == "load_offset":
+                # load_offset: writes dest[j], reads addr_vec[j]
+                _, dest, addr_vec, j = slot
+                writes.add((dest, j))
+                reads.add((addr_vec, j))
+        
+        elif engine == "store":
+            op = slot[0]
+            if op == "store":
+                _, addr, src = slot
+                reads.add((addr, 0))
+                reads.add((src, 0))
+            elif op == "vstore":
+                _, addr, src = slot
+                reads.add((addr, 0))
+                for j in range(VLEN):
+                    reads.add((src, j))
+        
+        elif engine == "flow":
+            op = slot[0]
+            if op == "select":
+                _, dest, cond, t, f = slot
+                writes.add((dest, 0))
+                reads.add((cond, 0))
+                reads.add((t, 0))
+                reads.add((f, 0))
+            elif op == "vselect":
+                _, dest, cond, t, f = slot
+                for j in range(VLEN):
+                    writes.add((dest, j))
+                    reads.add((cond, j))
+                    reads.add((t, j))
+                    reads.add((f, j))
+            elif op == "pause":
+                pass  # No deps
+        
+        return writes, reads
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         """
-        Pack slots into instruction bundles.
-        NO VLIW - 1 slot per instruction to preserve dependencies.
+        Pack slots into instruction bundles using list scheduling.
         """
-        instrs = []
+        if not slots:
+            return []
+        
+        n = len(slots)
+        
+        # Step 1: Extract dependencies for each slot
+        slot_writes = []
+        slot_reads = []
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            w, r = self.get_slot_deps(engine, slot)
+            slot_writes.append(w)
+            slot_reads.append(r)
+        
+        # Step 2: Build dependency graph - need BOTH RAW and WAR dependencies!
+        # RAW: slot j reads what slot i writes => j after i
+        # WAR: slot j writes what slot i reads => j after i (to preserve read value)
+        depth = [0] * n
+        
+        # Map: (addr, lane) -> last slot that wrote it (for RAW)
+        last_writer = {}
+        # Map: (addr, lane) -> last slot that read it (for WAR)
+        last_readers = defaultdict(list)
+        
+        war_deps_found = 0
+        raw_deps_found = 0
+        
+        for i in range(n):
+            # Find max depth of all dependencies
+            max_dep_depth = -1
+            
+            # RAW: I read something that was written before
+            for r in slot_reads[i]:
+                if r in last_writer:
+                    dep_idx = last_writer[r]
+                    max_dep_depth = max(max_dep_depth, depth[dep_idx])
+                    raw_deps_found += 1
+            
+            # WAR: I write something that was read before
+            for w in slot_writes[i]:
+                if w in last_readers:
+                    for reader_idx in last_readers[w]:
+                        max_dep_depth = max(max_dep_depth, depth[reader_idx])
+                        war_deps_found += 1
+            
+            depth[i] = max_dep_depth + 1
+            
+            # Update tracking
+            for w in slot_writes[i]:
+                last_writer[w] = i
+                last_readers[w] = []  # Clear readers when overwritten
+            for r in slot_reads[i]:
+                last_readers[r].append(i)
+        
+        # Step 3: Group by depth, then pack respecting SLOT_LIMITS
+        depth_groups = defaultdict(list)
+        for i in range(n):
+            engine = slots[i][0]
+            if engine != "debug":
+                depth_groups[depth[i]].append(i)
+        
+        instrs = []
+        max_depth = max(depth) if depth else 0
+        
+        for d in range(max_depth + 1):
+            group = depth_groups[d]
+            
+            # Pack slots at this depth into bundles respecting SLOT_LIMITS
+            bundle_slots = defaultdict(list)
+            bundle_counts = defaultdict(int)
+            
+            for idx in group:
+                engine, slot = slots[idx]
+                if engine == "debug":
+                    continue
+                
+                # Check if we can add to current bundle
+                limit = SLOT_LIMITS.get(engine, 1)
+                if bundle_counts[engine] < limit:
+                    bundle_slots[engine].append(slot)
+                    bundle_counts[engine] += 1
+                else:
+                    # Emit current bundle, start new one
+                    if bundle_slots:
+                        instrs.append(dict(bundle_slots))
+                    bundle_slots = defaultdict(list)
+                    bundle_counts = defaultdict(int)
+                    bundle_slots[engine].append(slot)
+                    bundle_counts[engine] = 1
+            
+            # Emit remaining bundle for this depth
+            if bundle_slots:
+                instrs.append(dict(bundle_slots))
+        
+        # ========== GANNINA_VLIW_RESULT gannina ==========
+        # 分析同一depth内是否有slots被错误分到不同bundle
+        depth_overflow_count = 0
+        for d in range(max_depth + 1):
+            group = depth_groups[d]
+            engine_counts = defaultdict(int)
+            for idx in group:
+                engine = slots[idx][0]
+                if engine != "debug":
+                    engine_counts[engine] += 1
+            for eng, cnt in engine_counts.items():
+                if cnt > SLOT_LIMITS.get(eng, 1):
+                    depth_overflow_count += 1
+        
+        print(f"\n[GANNINA_VLIW_SCHEDULER] gannina77777777777777")
+        print(f"  INPUT: {n} slots, OUTPUT: {len(instrs)} bundles, CYCLES: ~{len(instrs)} gannina")
+        print(f"  COMPRESSION: {n/len(instrs):.2f}x, MAX_DEPTH: {max_depth} gannina")
+        print(f"  RAW_DEPS: {raw_deps_found}, WAR_DEPS: {war_deps_found} gannina")
+        print(f"  gannina")
+        print(f"  CRITICAL_BUG: gannina99999999999999")
+        print(f"    WAR deps inflate MAX_DEPTH from ~23 to 13311! gannina")
+        print(f"    WAR across vec_iters is WRONG - they reuse scratch but run sequentially gannina")
+        print(f"    FIX: REMOVE WAR tracking, keep only RAW gannina")
+        print(f"  gannina")
+        
         return instrs
 
     def add(self, engine, slot):
@@ -138,31 +322,22 @@ class KernelBuilder:
         """Vector hash: 6 stages, each stage needs 3 valu ops"""
         slots = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # vec_tmp1 = vec_val op1 const1
-            # vec_tmp2 = vec_val op3 const3  
-            # vec_val = vec_tmp1 op2 vec_tmp2
             const1_vec = vec_hash_consts[hi * 2]
             const3_vec = vec_hash_consts[hi * 2 + 1]
             slots.append(("valu", (op1, vec_tmp1, vec_val, const1_vec)))
             slots.append(("valu", (op3, vec_tmp2, vec_val, const3_vec)))
             slots.append(("valu", (op2, vec_val, vec_tmp1, vec_tmp2)))
-            # Debug: compare each lane
             slots.append(("debug", ("vcompare", vec_val, tuple((round, vi + j, "hash_stage", hi) for j in range(VLEN)))))
         return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
-        GANNINA: PHASE 1 - VECTORIZED implementation
-        Process 8 elements at a time using SIMD instructions.
-        """
-        # Scalar temporaries for address computation
+        """VECTORIZED kernel - Phase 1"""
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp_addr = self.alloc_scratch("tmp_addr")
         
-        # Load init vars from memory header
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
             "forest_values_p", "inp_indices_p", "inp_values_p",
@@ -173,12 +348,10 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        # Scalar constants
         zero_const = self.scratch_const(0, "zero")
         one_const = self.scratch_const(1, "one")
         two_const = self.scratch_const(2, "two")
 
-        # ===== VECTOR SCRATCH ALLOCATION (VLEN=8) =====
         vec_idx = self.alloc_scratch("vec_idx", VLEN)
         vec_val = self.alloc_scratch("vec_val", VLEN)
         vec_node = self.alloc_scratch("vec_node", VLEN)
@@ -187,21 +360,18 @@ class KernelBuilder:
         vec_tmp2 = self.alloc_scratch("vec_tmp2", VLEN)
         vec_tmp3 = self.alloc_scratch("vec_tmp3", VLEN)
         
-        # Vector constants (need to broadcast scalar to vector)
         vec_zero = self.alloc_scratch("vec_zero", VLEN)
         vec_one = self.alloc_scratch("vec_one", VLEN)
         vec_two = self.alloc_scratch("vec_two", VLEN)
         vec_forest_p = self.alloc_scratch("vec_forest_p", VLEN)
         vec_n_nodes = self.alloc_scratch("vec_n_nodes", VLEN)
         
-        # Broadcast scalar constants to vectors
         self.add("valu", ("vbroadcast", vec_zero, zero_const))
         self.add("valu", ("vbroadcast", vec_one, one_const))
         self.add("valu", ("vbroadcast", vec_two, two_const))
         self.add("valu", ("vbroadcast", vec_forest_p, self.scratch["forest_values_p"]))
         self.add("valu", ("vbroadcast", vec_n_nodes, self.scratch["n_nodes"]))
         
-        # Hash constants - need vector versions
         vec_hash_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             scalar_c1 = self.scratch_const(val1, f"hash_{hi}_c1")
@@ -216,42 +386,31 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting vectorized loop"))
 
-        body = []  # array of slots
+        body = []
 
         for round in range(rounds):
             for vi in range(0, batch_size, VLEN):
-                # Compute addresses for this vector chunk
                 vi_const = self.scratch_const(vi, f"vi_{vi}")
                 
-                # tmp_addr = inp_indices_p + vi (scalar addr for vload)
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], vi_const)))
-                # vload vec_idx from mem[inp_indices_p + vi : +8]
                 body.append(("load", ("vload", vec_idx, tmp_addr)))
                 body.append(("debug", ("vcompare", vec_idx, tuple((round, vi + j, "idx") for j in range(VLEN)))))
                 
-                # tmp_addr = inp_values_p + vi
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], vi_const)))
-                # vload vec_val from mem[inp_values_p + vi : +8]
                 body.append(("load", ("vload", vec_val, tmp_addr)))
                 body.append(("debug", ("vcompare", vec_val, tuple((round, vi + j, "val") for j in range(VLEN)))))
                 
-                # vec_addr = forest_values_p + vec_idx (element-wise)
                 body.append(("valu", ("+", vec_addr, vec_forest_p, vec_idx)))
                 
-                # GATHER: load node values from non-contiguous addresses
-                # load_offset(dest, addr, j) => scratch[dest+j] = mem[scratch[addr+j]]
                 for j in range(VLEN):
                     body.append(("load", ("load_offset", vec_node, vec_addr, j)))
                 body.append(("debug", ("vcompare", vec_node, tuple((round, vi + j, "node_val") for j in range(VLEN)))))
                 
-                # vec_val = vec_val ^ vec_node
                 body.append(("valu", ("^", vec_val, vec_val, vec_node)))
                 
-                # Hash: 6 stages
                 body.extend(self.build_vector_hash(vec_val, vec_tmp1, vec_tmp2, vec_hash_consts, round, vi))
                 body.append(("debug", ("vcompare", vec_val, tuple((round, vi + j, "hashed_val") for j in range(VLEN)))))
                 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 body.append(("valu", ("%", vec_tmp1, vec_val, vec_two)))
                 body.append(("valu", ("==", vec_tmp1, vec_tmp1, vec_zero)))
                 body.append(("flow", ("vselect", vec_tmp3, vec_tmp1, vec_one, vec_two)))
@@ -259,30 +418,56 @@ class KernelBuilder:
                 body.append(("valu", ("+", vec_idx, vec_idx, vec_tmp3)))
                 body.append(("debug", ("vcompare", vec_idx, tuple((round, vi + j, "next_idx") for j in range(VLEN)))))
                 
-                # idx = 0 if idx >= n_nodes else idx
                 body.append(("valu", ("<", vec_tmp1, vec_idx, vec_n_nodes)))
                 body.append(("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, vec_zero)))
                 body.append(("debug", ("vcompare", vec_idx, tuple((round, vi + j, "wrapped_idx") for j in range(VLEN)))))
                 
-                # Store results back
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], vi_const)))
                 body.append(("store", ("vstore", tmp_addr, vec_idx)))
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], vi_const)))
                 body.append(("store", ("vstore", tmp_addr, vec_val)))
 
-        # Collect slot stats
         engine_counts = defaultdict(int)
         for e, s in body:
             engine_counts[e] += 1
 
-        # ========== STRATEGIC PRINT FOR PHASE 1 gannina ==========
         total_instrs = sum(v for k,v in engine_counts.items() if k != 'debug')
         vec_iters = rounds * (batch_size // VLEN)
-        print(f"\n[GANNINA_PHASE1_VECTOR] rounds={rounds} batch={batch_size} vec_iters={vec_iters} gannina")
-        print(f"  VECTOR_INSTRS: valu={engine_counts['valu']} alu={engine_counts['alu']} load={engine_counts['load']} store={engine_counts['store']} flow={engine_counts['flow']} gannina")
-        print(f"  TOTAL_INSTRS: {total_instrs} (was 147456 scalar) gannina")
-        print(f"  PER_VEC_ITER: valu={engine_counts['valu']//vec_iters} alu={engine_counts['alu']//vec_iters} load={engine_counts['load']//vec_iters} store={engine_counts['store']//vec_iters} flow={engine_counts['flow']//vec_iters} gannina")
-        print(f"  NEXT: Apply VLIW packing to reduce cycles further gannina\n")
+        
+        # ========== GANNINA: BREAKTHROUGH ANALYSIS gannina ==========
+        load_per_iter = engine_counts['load'] // vec_iters
+        valu_per_iter = engine_counts['valu'] // vec_iters
+        flow_per_iter = engine_counts['flow'] // vec_iters
+        
+        # Calculate theoretical min with perfect VLIW
+        load_cycles = (load_per_iter + 1) // 2  # ceil(10/2) = 5
+        valu_cycles = (valu_per_iter + 5) // 6  # ceil(25/6) = 5
+        flow_cycles = flow_per_iter             # 2/1 = 2
+        naive_min = vec_iters * max(load_cycles, valu_cycles, flow_cycles)
+        
+        # With software pipelining: overlap store[i] with load[i+1]
+        pipeline_min = vec_iters * max(load_cycles - 1, valu_cycles, flow_cycles)
+        
+        print(f"\n[GANNINA_BREAKTHROUGH_ANALYSIS] gannina11111111111111")
+        print(f"  CURRENT: {total_instrs} instrs => 22094 cycles (no VLIW) gannina")
+        print(f"  NAIVE_VLIW_MIN: {naive_min} cycles (load-bound: {load_cycles} cyc/iter) gannina")
+        print(f"  TARGET: <1487 cycles gannina")
+        print(f"  GAP: {naive_min} > 1487, VLIW alone NOT ENOUGH! gannina")
+        print(f"  gannina")
+        print(f"  BOTTLENECK_DETAIL (per iter): gannina222222222222222")
+        print(f"    gather: 8 load_offset => 4 cycles (limit=2) gannina")
+        print(f"    vload: 2 ops => 1 cycle gannina")
+        print(f"    valu: {valu_per_iter} ops => {valu_cycles} cycles (limit=6) gannina")
+        print(f"    flow: {flow_per_iter} ops => {flow_cycles} cycles (limit=1) gannina")
+        print(f"  gannina")
+        print(f"  SOFTWARE_PIPELINE_POTENTIAL: gannina333333333333333")
+        print(f"    Overlap: iter[i].valu with iter[i].gather (both need ~4-5 cycles) gannina")
+        print(f"    Overlap: iter[i].store with iter[i+1].vload gannina")
+        print(f"    ESTIMATED: ~{pipeline_min} cycles gannina")
+        print(f"  gannina4444444444444444444")
+        print(f"  TO_REACH_1487: Need {naive_min/1487:.1f}x reduction gannina")
+        print(f"  NEXT: Implement VLIW scheduler with dependency analysis gannina")
+        print(f"  gannina")
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
@@ -341,9 +526,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -356,7 +538,6 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
     def test_kernel_cycles(self):

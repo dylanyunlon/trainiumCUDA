@@ -14,6 +14,43 @@ Validate your results using `python tests/submission_tests.py` without modifying
 anything in the tests/ folder.
 
 We recommend you look through problem.py next.
+
+================================================================================
+GANNINA_OPTIMIZATION_LOG (DO NOT DELETE - PERSISTENT STATE FOR NEXT CONVERSATION)
+================================================================================
+PHASE: 0 - SCALAR BASELINE
+CYCLES: 147734
+TARGET: <1487 cycles (100x speedup needed)
+
+FAILED_ATTEMPTS:
+- VLIW packing alone FAILED: dependencies between alu->load prevent parallel exec
+- Example: alu(tmp_addr=p+i) then load(x=mem[tmp_addr]) - load reads OLD tmp_addr
+
+ARCHITECTURE_KEY_FACTS:
+- SLOT_LIMITS: alu=12, valu=6, load=2, store=2, flow=1 per cycle
+- VLEN=8 (vector length)
+- VLIW: all reads happen BEFORE all writes in same cycle
+
+NEXT_STEP: VECTORIZATION (Phase 1)
+- Replace scalar loop with vector loop processing 8 elements at once
+- 16 rounds * 32 vector_iters = 512 total vector iterations
+- Expected cycles: ~2048 (then apply VLIW packing for further gains)
+
+VECTORIZATION_TRAPS:
+- TRAP1: vbroadcast(dest, src) - src must be SCALAR address
+- TRAP2: load_offset(dest, addr, j) => scratch[dest+j] = mem[scratch[addr+j]]
+- TRAP3: vload/vstore addr parameter is SCALAR (base address)
+- TRAP4: Hash constants need vbroadcast to vector first
+- TRAP5: For gather, use 8x load_offset, NOT vload (vload is contiguous only)
+
+VECTOR_INSTRUCTION_REFERENCE:
+- ('valu', ('vbroadcast', vec_dest, scalar_src)) - broadcast scalar to vector
+- ('valu', (op, vec_dest, vec_a, vec_b)) - element-wise vector op
+- ('load', ('vload', vec_dest, scalar_addr)) - load 8 contiguous elements
+- ('load', ('load_offset', dest, addr, j)) - dest[j] = mem[addr[j]] (for gather)
+- ('store', ('vstore', scalar_addr, vec_src)) - store 8 contiguous elements
+- ('flow', ('vselect', vec_dest, vec_cond, vec_a, vec_b)) - vector select
+================================================================================
 """
 
 from collections import defaultdict
@@ -38,6 +75,15 @@ from problem import (
 
 
 class KernelBuilder:
+    """
+    GANNINA_STATE: PHASE 0 - SCALAR BASELINE (147734 cycles)
+    GANNINA_NEXT: Implement vectorization in build_kernel
+    GANNINA_TRAPS:
+    - vbroadcast needs SCALAR src address
+    - load_offset for gather: dest[j]=mem[addr[j]]
+    - vload/vstore addr is SCALAR base
+    - Hash constants need vbroadcast first
+    """
     def __init__(self):
         self.instrs = []
         self.scratch = {}
@@ -88,26 +134,38 @@ class KernelBuilder:
 
         return slots
 
+    def build_vector_hash(self, vec_val, vec_tmp1, vec_tmp2, vec_hash_consts, round, vi):
+        """Vector hash: 6 stages, each stage needs 3 valu ops"""
+        slots = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # vec_tmp1 = vec_val op1 const1
+            # vec_tmp2 = vec_val op3 const3  
+            # vec_val = vec_tmp1 op2 vec_tmp2
+            const1_vec = vec_hash_consts[hi * 2]
+            const3_vec = vec_hash_consts[hi * 2 + 1]
+            slots.append(("valu", (op1, vec_tmp1, vec_val, const1_vec)))
+            slots.append(("valu", (op3, vec_tmp2, vec_val, const3_vec)))
+            slots.append(("valu", (op2, vec_val, vec_tmp1, vec_tmp2)))
+            # Debug: compare each lane
+            slots.append(("debug", ("vcompare", vec_val, tuple((round, vi + j, "hash_stage", hi) for j in range(VLEN)))))
+        return slots
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        GANNINA: PHASE 1 - VECTORIZED implementation
+        Process 8 elements at a time using SIMD instructions.
         """
+        # Scalar temporaries for address computation
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
+        tmp_addr = self.alloc_scratch("tmp_addr")
         
-        # Scratch space addresses
+        # Load init vars from memory header
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
@@ -115,145 +173,120 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Scalar constants
+        zero_const = self.scratch_const(0, "zero")
+        one_const = self.scratch_const(1, "one")
+        two_const = self.scratch_const(2, "two")
+
+        # ===== VECTOR SCRATCH ALLOCATION (VLEN=8) =====
+        vec_idx = self.alloc_scratch("vec_idx", VLEN)
+        vec_val = self.alloc_scratch("vec_val", VLEN)
+        vec_node = self.alloc_scratch("vec_node", VLEN)
+        vec_addr = self.alloc_scratch("vec_addr", VLEN)
+        vec_tmp1 = self.alloc_scratch("vec_tmp1", VLEN)
+        vec_tmp2 = self.alloc_scratch("vec_tmp2", VLEN)
+        vec_tmp3 = self.alloc_scratch("vec_tmp3", VLEN)
+        
+        # Vector constants (need to broadcast scalar to vector)
+        vec_zero = self.alloc_scratch("vec_zero", VLEN)
+        vec_one = self.alloc_scratch("vec_one", VLEN)
+        vec_two = self.alloc_scratch("vec_two", VLEN)
+        vec_forest_p = self.alloc_scratch("vec_forest_p", VLEN)
+        vec_n_nodes = self.alloc_scratch("vec_n_nodes", VLEN)
+        
+        # Broadcast scalar constants to vectors
+        self.add("valu", ("vbroadcast", vec_zero, zero_const))
+        self.add("valu", ("vbroadcast", vec_one, one_const))
+        self.add("valu", ("vbroadcast", vec_two, two_const))
+        self.add("valu", ("vbroadcast", vec_forest_p, self.scratch["forest_values_p"]))
+        self.add("valu", ("vbroadcast", vec_n_nodes, self.scratch["n_nodes"]))
+        
+        # Hash constants - need vector versions
+        vec_hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            scalar_c1 = self.scratch_const(val1, f"hash_{hi}_c1")
+            scalar_c3 = self.scratch_const(val3, f"hash_{hi}_c3")
+            vec_c1 = self.alloc_scratch(f"vec_hash_{hi}_c1", VLEN)
+            vec_c3 = self.alloc_scratch(f"vec_hash_{hi}_c3", VLEN)
+            self.add("valu", ("vbroadcast", vec_c1, scalar_c1))
+            self.add("valu", ("vbroadcast", vec_c3, scalar_c3))
+            vec_hash_consts.append(vec_c1)
+            vec_hash_consts.append(vec_c3)
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting loop"))
+        self.add("debug", ("comment", "Starting vectorized loop"))
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
-
         for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
+            for vi in range(0, batch_size, VLEN):
+                # Compute addresses for this vector chunk
+                vi_const = self.scratch_const(vi, f"vi_{vi}")
                 
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+                # tmp_addr = inp_indices_p + vi (scalar addr for vload)
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], vi_const)))
+                # vload vec_idx from mem[inp_indices_p + vi : +8]
+                body.append(("load", ("vload", vec_idx, tmp_addr)))
+                body.append(("debug", ("vcompare", vec_idx, tuple((round, vi + j, "idx") for j in range(VLEN)))))
+                
+                # tmp_addr = inp_values_p + vi
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], vi_const)))
+                # vload vec_val from mem[inp_values_p + vi : +8]
+                body.append(("load", ("vload", vec_val, tmp_addr)))
+                body.append(("debug", ("vcompare", vec_val, tuple((round, vi + j, "val") for j in range(VLEN)))))
+                
+                # vec_addr = forest_values_p + vec_idx (element-wise)
+                body.append(("valu", ("+", vec_addr, vec_forest_p, vec_idx)))
+                
+                # GATHER: load node values from non-contiguous addresses
+                # load_offset(dest, addr, j) => scratch[dest+j] = mem[scratch[addr+j]]
+                for j in range(VLEN):
+                    body.append(("load", ("load_offset", vec_node, vec_addr, j)))
+                body.append(("debug", ("vcompare", vec_node, tuple((round, vi + j, "node_val") for j in range(VLEN)))))
+                
+                # vec_val = vec_val ^ vec_node
+                body.append(("valu", ("^", vec_val, vec_val, vec_node)))
+                
+                # Hash: 6 stages
+                body.extend(self.build_vector_hash(vec_val, vec_tmp1, vec_tmp2, vec_hash_consts, round, vi))
+                body.append(("debug", ("vcompare", vec_val, tuple((round, vi + j, "hashed_val") for j in range(VLEN)))))
+                
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+                body.append(("valu", ("%", vec_tmp1, vec_val, vec_two)))
+                body.append(("valu", ("==", vec_tmp1, vec_tmp1, vec_zero)))
+                body.append(("flow", ("vselect", vec_tmp3, vec_tmp1, vec_one, vec_two)))
+                body.append(("valu", ("*", vec_idx, vec_idx, vec_two)))
+                body.append(("valu", ("+", vec_idx, vec_idx, vec_tmp3)))
+                body.append(("debug", ("vcompare", vec_idx, tuple((round, vi + j, "next_idx") for j in range(VLEN)))))
+                
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                body.append(("valu", ("<", vec_tmp1, vec_idx, vec_n_nodes)))
+                body.append(("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, vec_zero)))
+                body.append(("debug", ("vcompare", vec_idx, tuple((round, vi + j, "wrapped_idx") for j in range(VLEN)))))
+                
+                # Store results back
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], vi_const)))
+                body.append(("store", ("vstore", tmp_addr, vec_idx)))
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], vi_const)))
+                body.append(("store", ("vstore", tmp_addr, vec_val)))
 
         # Collect slot stats
         engine_counts = defaultdict(int)
         for e, s in body:
             engine_counts[e] += 1
 
+        # ========== STRATEGIC PRINT FOR PHASE 1 gannina ==========
+        total_instrs = sum(v for k,v in engine_counts.items() if k != 'debug')
+        vec_iters = rounds * (batch_size // VLEN)
+        print(f"\n[GANNINA_PHASE1_VECTOR] rounds={rounds} batch={batch_size} vec_iters={vec_iters} gannina")
+        print(f"  VECTOR_INSTRS: valu={engine_counts['valu']} alu={engine_counts['alu']} load={engine_counts['load']} store={engine_counts['store']} flow={engine_counts['flow']} gannina")
+        print(f"  TOTAL_INSTRS: {total_instrs} (was 147456 scalar) gannina")
+        print(f"  PER_VEC_ITER: valu={engine_counts['valu']//vec_iters} alu={engine_counts['alu']//vec_iters} load={engine_counts['load']//vec_iters} store={engine_counts['store']//vec_iters} flow={engine_counts['flow']//vec_iters} gannina")
+        print(f"  NEXT: Apply VLIW packing to reduce cycles further gannina\n")
+
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
         self.instrs.append({"flow": [("pause",)]})
-        
-        # ========== CRITICAL STATUS PRINT FOR NEXT CONVERSATION gannina ==========
-        print("\n" + "="*70 + " gannina")
-        print("STATUS: PHASE 0 - BASELINE (NO VLIW, NO SIMD) gannina")
-        print("="*70 + " gannina")
-        print(f"SLOT_STATS: {dict(engine_counts)} gannina")
-        print(f"TOTAL_INSTRS: {len(body_instrs)} gannina")
-        print(f"TARGET: <1487 cycles gannina")
-        print(f"gannina")
-        print(f"===== WHY VLIW PACKING FAILED ===== gannina")
-        print(f"VLIW bundles execute in PARALLEL - all reads happen BEFORE writes! gannina")
-        print(f"Example dependency: alu(tmp_addr=p+i) -> load(x=mem[tmp_addr]) gannina")
-        print(f"If packed together: load reads OLD tmp_addr value = WRONG! gannina")
-        print(f"gannina")
-        print(f"===== CORRECT APPROACH: VECTORIZATION FIRST ===== gannina")
-        print(f"SIMD processes 8 elements with ONE instruction gannina")
-        print(f"This reduces total ops by 8x WITHOUT dependency issues gannina")
-        print(f"gannina")
-        print(f"===== BENCHMARKS ===== gannina")
-        print(f"147734: baseline | 18532: 2hr-start | 2164: Opus4 gannina")
-        print(f"1790: Opus4.5casual | 1579: Opus4.5-2hr | 1487: Opus4.5-11hr gannina")
-        print(f"gannina111111111111111111111111111111111111111")
-        print(f"===== PHASE 1: VECTORIZATION (REWRITE build_kernel) ===== gannina")
-        print(f"GOAL: Replace scalar ops with vector ops, 8 elements at once gannina")
-        print(f"gannina")
-        print(f"VECTOR SCRATCH ALLOCATION: gannina")
-        print(f"  vec_idx = alloc_scratch('vec_idx', VLEN)  # 8 indices gannina")
-        print(f"  vec_val = alloc_scratch('vec_val', VLEN)  # 8 values gannina")
-        print(f"  vec_node = alloc_scratch('vec_node', VLEN) # 8 node values gannina")
-        print(f"  vec_addr = alloc_scratch('vec_addr', VLEN) # 8 addresses gannina")
-        print(f"  vec_tmp1/2/3 = alloc_scratch(..., VLEN) gannina")
-        print(f"gannina")
-        print(f"VECTOR CONSTANTS (vbroadcast scalar to vector): gannina")
-        print(f"  ('valu', ('vbroadcast', vec_zero, zero_const)) gannina")
-        print(f"  ('valu', ('vbroadcast', vec_one, one_const)) gannina")
-        print(f"  ('valu', ('vbroadcast', vec_two, two_const)) gannina")
-        print(f"  ('valu', ('vbroadcast', vec_forest_p, forest_values_p)) gannina")
-        print(f"gannina")
-        print(f"MAIN LOOP: for round in rounds: for vi in range(0,batch_size,VLEN): gannina")
-        print(f"  # Load 8 contiguous indices gannina")
-        print(f"  ('alu', ('+', addr_tmp, inp_indices_p, vi_const)) gannina")
-        print(f"  ('load', ('vload', vec_idx, addr_tmp)) gannina")
-        print(f"  gannina")
-        print(f"  # Load 8 contiguous values gannina")
-        print(f"  ('alu', ('+', addr_tmp, inp_values_p, vi_const)) gannina")
-        print(f"  ('load', ('vload', vec_val, addr_tmp)) gannina")
-        print(f"  gannina")
-        print(f"  # Compute addresses: vec_addr = forest_p + vec_idx gannina")
-        print(f"  ('valu', ('+', vec_addr, vec_forest_p, vec_idx)) gannina")
-        print(f"  gannina")
-        print(f"  # GATHER: Load 8 scattered node values gannina")
-        print(f"  for j in range(VLEN): gannina")
-        print(f"    ('load', ('load_offset', vec_node, vec_addr, j)) gannina")
-        print(f"  gannina")
-        print(f"  # XOR and hash gannina")
-        print(f"  ('valu', ('^', vec_val, vec_val, vec_node)) gannina")
-        print(f"  # ... 6 hash stages with valu ... gannina")
-        print(f"  gannina")
-        print(f"  # Branch logic gannina")
-        print(f"  ('valu', ('%', vec_tmp1, vec_val, vec_two)) gannina")
-        print(f"  ('valu', ('==', vec_tmp1, vec_tmp1, vec_zero)) gannina")
-        print(f"  ('flow', ('vselect', vec_tmp3, vec_tmp1, vec_one, vec_two)) gannina")
-        print(f"  ('valu', ('*', vec_idx, vec_idx, vec_two)) gannina")
-        print(f"  ('valu', ('+', vec_idx, vec_idx, vec_tmp3)) gannina")
-        print(f"  gannina")
-        print(f"  # Wrap check gannina")
-        print(f"  ('valu', ('<', vec_tmp1, vec_idx, vec_n_nodes)) gannina")
-        print(f"  ('flow', ('vselect', vec_idx, vec_tmp1, vec_idx, vec_zero)) gannina")
-        print(f"  gannina")
-        print(f"  # Store results gannina")
-        print(f"  ('store', ('vstore', addr_tmp, vec_idx)) gannina")
-        print(f"  ('store', ('vstore', addr_tmp, vec_val)) gannina")
-        print(f"gannina")
-        print(f"EXPECTED: 16*32 = 512 vector iterations gannina")
-        print(f"Per iter: ~8 loads + ~20 valu + 2 flow + 2 stores gannina")
-        print(f"Cycles: ~512 * max(load/2, valu/6, flow/1, store/2) gannina")
-        print(f"       = 512 * max(4, 4, 2, 1) = 512 * 4 = ~2048 cycles gannina")
-        print("="*70 + " gannina\n")
 
 
 BASELINE = 147734
@@ -290,7 +323,7 @@ def do_kernel_test(
         inp_values_p = ref_mem[6]
         if prints:
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+            print(ref_mem[inp_values_p : ref_mem[6] + len(inp.values)])
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]

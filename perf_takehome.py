@@ -1258,123 +1258,158 @@ class KernelBuilder:
         print(f"    Then measure actual cycles")
         print(f"  gannina")
 
-        # ===== MAIN LOOP =====
-        for r in range(rounds):
-            # GATHER
-            if r == 0:
-                # Level 0: all elements get same value
-                for k in range(U):
-                    self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"r{r}_gather")
-            elif r == 1:
-                # Level 1: 1-bit mux based on idx
-                # idx is 1 or 2, so (idx-1) is 0 or 1
-                # NOTE: Use v_ad as temp instead of v_t1 (v_t1 is aliased to v_nv!)
-                for k in range(U):
-                    self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_gather")
-                    self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_gather")
-            elif r == 2:
-                # Level 2: gather (vselect mux needs Level 2 cache which overflows scratch)
-                # SCRATCH SITUATION:
-                #   With un-aliased temps: 1508/1536 (61 free)
-                #   Level 2 cache needs: 36 slots
-                #   But constant pool uses ~50 slots
-                #   OVERFLOW by ~10 slots
-                # NEXT_STEP: Optimize i_cr constants to free 36+ slots
+        # ===== GANNINA PHASE 39: TILE PROCESSING EXPERIMENT ===== gannina
+        # KEY INSIGHT FROM 110SPEEDUP:
+        # "rounds were handled in tiles rather than one at a time"
+        # This allows flow ops (vselect) to overlap with valu ops from DIFFERENT batch elements
+        #
+        # CURRENT ISSUE: Sequential round processing means:
+        #   round[r].vselect -> RAW dependency -> round[r].hash -> ...
+        #   No valu ops available to hide vselect latency!
+        #
+        # TILE SOLUTION: Interleave ops from different batch elements
+        #   batch[k].round[r].vselect can overlap with batch[k'].round[r-1].hash (k' != k)
+        #
+        # IMPLEMENTATION: For rounds 0-3, add ops in a different order:
+        #   Instead of: for r: for k: ops(r,k)
+        #   Use: for k: for r: ops(r,k)
+        
+        USE_TILE_PROCESSING = True  # gannina: Set True to test tile processing
+        
+        if USE_TILE_PROCESSING:
+            # ===== TILE 1: Rounds 0-3 with interleaved batch processing =====
+            # This allows flow ops to overlap with valu ops from different batch elements
+            print(f"\n[GANNINA_TILE_EXPERIMENT] gannina_phase39_tileexp ZZZZZZZZ")
+            print(f"  TESTING: Tile processing for rounds 0-3")
+            print(f"  HYPOTHESIS: Interleaving batch elements allows flow/valu overlap")
+            print(f"  gannina")
+            
+            # Process each batch element through rounds 0-3 before moving to next
+            for k in range(U):
+                for r in range(4):  # Tile 1: rounds 0-3
+                    # GATHER
+                    if r == 0:
+                        self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"r{r}_gather")
+                    elif r == 1:
+                        self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_gather")
+                        self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_gather")
+                    elif r == 2:
+                        self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                        for lane in range(VLEN):
+                            self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                    elif r == 3:
+                        self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                        for lane in range(VLEN):
+                            self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                    
+                    # XOR
+                    self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"r{r}_xor")
+                    
+                    # HASH
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        stype, c1, c2 = v_hash_consts[hi]
+                        if stype == "multiply_add":
+                            self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"r{r}_hash{hi}")
+                        else:
+                            self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"r{r}_hash{hi}")
+                    
+                    # IDX UPDATE (3-op)
+                    self.add("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one), tag=f"r{r}_idx")
+                    self.add("valu", ("&", v_t1[k], v_val[k], v_one), tag=f"r{r}_idx")
+                    self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_idx")
+                    
+                    # WRAP
+                    self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"r{r}_wrap")
+                    self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_wrap")
+            
+            # ===== Rounds 4-15: Keep original structure =====
+            for r in range(4, rounds):
+                # GATHER
                 for k in range(U):
                     self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
                 for k in range(U):
                     for lane in range(VLEN):
                         self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
-            elif r == 3:
-                # Level 3: Using gather
-                # 110speedup INSIGHT: They got 1338 by:
-                # 1. Level 0-3 vselect mux (requires clever register allocation)
-                # 2. "Group and tile processing" - process batches in groups
-                # 3. "Round fusion" - rounds processed in tiles
-                # 
-                # Current register constraint:
-                #   v_nv aliased to v_t1 (saves 256 slots)
-                #   v_ad used for address calculation
-                #   8-way mux needs 4 live temps simultaneously
-                #   We only have 2 (v_t1 and v_ad)
-                #
-                # SOLUTION from 110speedup:
-                #   They likely DON'T alias v_nv/v_t1
-                #   Extra 256 slots allows 4-temp mux
-                #   Trade-off: +256 scratch for -1024 loads
+                
+                # XOR
                 for k in range(U):
-                    self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                    self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"r{r}_xor")
+                
+                # HASH
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    stype, c1, c2 = v_hash_consts[hi]
+                    if stype == "multiply_add":
+                        for k in range(U):
+                            self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"r{r}_hash{hi}")
+                    else:
+                        for k in range(U):
+                            self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"r{r}_hash{hi}")
+                
+                # IDX UPDATE (3-op)
                 for k in range(U):
-                    for lane in range(VLEN):
-                        self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
-            else:
-                # Regular gather for rounds >= 4
+                    self.add("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one), tag=f"r{r}_idx")
+                    self.add("valu", ("&", v_t1[k], v_val[k], v_one), tag=f"r{r}_idx")
+                    self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_idx")
+                
+                # WRAP
                 for k in range(U):
-                    self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
-                for k in range(U):
-                    for lane in range(VLEN):
-                        self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                    self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"r{r}_wrap")
+                    self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_wrap")
+        
+        else:
+            # ===== ORIGINAL MAIN LOOP (fallback) =====
+            for r in range(rounds):
+                # GATHER
+                if r == 0:
+                    for k in range(U):
+                        self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"r{r}_gather")
+                elif r == 1:
+                    for k in range(U):
+                        self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_gather")
+                        self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_gather")
+                elif r == 2 or r == 3:
+                    for k in range(U):
+                        self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                    for k in range(U):
+                        for lane in range(VLEN):
+                            self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                else:
+                    for k in range(U):
+                        self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                    for k in range(U):
+                        for lane in range(VLEN):
+                            self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
 
-            # XOR - EXPERIMENT: Try migrating to ALU
-            # ALU has 12 slots vs VALU 6, but ALU processes scalar
-            # 8 ALU ops per vector = 1 VALU op equivalent
-            # Test: Use ALU for XOR to free VALU capacity
-            USE_ALU_XOR = False  # Set True to experiment
-            if USE_ALU_XOR:
-                # Lane-wise XOR using scalar ALU
-                for k in range(U):
-                    for lane in range(VLEN):
-                        self.add("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane), tag=f"r{r}_xor_alu")
-            else:
+                # XOR
                 for k in range(U):
                     self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"r{r}_xor")
 
-            # HASH
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                stype, c1, c2 = v_hash_consts[hi]
-                if stype == "multiply_add":
-                    for k in range(U):
-                        self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"r{r}_hash{hi}")
-                else:
-                    for k in range(U):
-                        self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"r{r}_hash{hi}")
-                        self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"r{r}_hash{hi}")
-                        self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"r{r}_hash{hi}")
+                # HASH
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    stype, c1, c2 = v_hash_consts[hi]
+                    if stype == "multiply_add":
+                        for k in range(U):
+                            self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"r{r}_hash{hi}")
+                    else:
+                        for k in range(U):
+                            self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"r{r}_hash{hi}")
 
-            # IDX UPDATE (bitwise)
-            # OPTIMIZATION: 3-op version using multiply_add
-            # Original formula: idx = 2*idx + (1 if even else 2) = 2*idx + 1 + (val&1)
-            # 
-            # 4-op version: idx<<1, val&1, t1+1, idx+t1
-            # 3-op version: multiply_add(idx, 2, 1), val&1, idx+t1
-            #   Step 1: idx = idx * 2 + 1 (multiply_add)
-            #   Step 2: t1 = val & 1
-            #   Step 3: idx = idx + t1
-            # 
-            USE_3OP_IDX = True  # gannina: Set True to test 3-op optimization
-            if USE_3OP_IDX:
+                # IDX UPDATE (3-op)
                 for k in range(U):
-                    # multiply_add: idx = idx * 2 + 1
                     self.add("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one), tag=f"r{r}_idx")
-                    # odd = val & 1
                     self.add("valu", ("&", v_t1[k], v_val[k], v_one), tag=f"r{r}_idx")
-                    # idx = idx + odd
-                    self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_idx")
-            else:
-                for k in range(U):
-                    self.add("valu", ("<<", v_idx[k], v_idx[k], v_one), tag=f"r{r}_idx")
-                    self.add("valu", ("&", v_t1[k], v_val[k], v_one), tag=f"r{r}_idx")
-                    self.add("valu", ("+", v_t1[k], v_t1[k], v_one), tag=f"r{r}_idx")
                     self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_idx")
 
-            # WRAP: Keep valu(*) - flow(vselect) hurts scheduling
-            # Attempted: valu(<) + flow(vselect) instead of valu(<) + valu(*)
-            # Result: 2100 -> 2115 cycles (WORSE!)
-            # Reason: Added 512 flow ops interfered with load scheduling
-            #         Scheduling overhead increased from 294 to 363 cycles
-            for k in range(U):
-                self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"r{r}_wrap")
-                self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_wrap")
+                # WRAP
+                for k in range(U):
+                    self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"r{r}_wrap")
+                    self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_wrap")
 
         # STORE
         for k in range(U):
@@ -1423,6 +1458,54 @@ class KernelBuilder:
         print(f"    1. https://medium.com/@indosambhav/ (110x speedup to 1338)")
         print(f"    2. https://trirpi.github.io/posts/anthropic-performance-takehome/")
         print(f"    3. https://github.com/anthropics/original_performance_takehome")
+        print(f"  gannina")
+        
+        # ===== GANNINA PHASE 38: TILE PROCESSING ARCHITECTURE BLUEPRINT ===== gannina
+        print(f"\n[GANNINA_TILE_ARCHITECTURE] gannina_phase38_tile ZZZZZZZZ")
+        print(f"  ROOT_CAUSE_OF_VSELECT_FAILURE:")
+        print(f"    Our architecture: SEQUENTIAL round-by-round")
+        print(f"    110speedup architecture: TILE processing")
+        print(f"    KEY_QUOTE: 'rounds were handled in tiles rather than one at a time'")
+        print(f"  gannina")
+        print(f"  WHY_VSELECT_FAILED_FOR_US:")
+        print(f"    Sequential: round[r] must FINISH before round[r+1] starts")
+        print(f"    Flow vselect for round[r] has RAW dependency on round[r-1].idx")
+        print(f"    Cannot overlap - creates 96 SERIAL flow cycles")
+        print(f"  gannina")
+        print(f"  WHY_VSELECT_WORKED_FOR_110SPEEDUP:")
+        print(f"    Tile processing: Process [round 0-3] × [batch_k] as a TILE")
+        print(f"    Within tile: round[r].vselect for batch_k overlaps with")
+        print(f"                 round[r-1].hash for batch_{k+1}")
+        print(f"    Flow ops hide behind valu ops from DIFFERENT batches!")
+        print(f"  gannina")
+        print(f"  TILE_ARCHITECTURE_DESIGN:")
+        print(f"    CURRENT_LOOP: for r in 16: for k in 32: process(r,k)")
+        print(f"    TILE_LOOP:    for t in TILES: for k in 32: for r in tile[t]: process(r,k)")
+        print(f"    TILE_SIZE: 4 rounds (matches Level 0-3 cache)")
+        print(f"    TILES: [0-3], [4-7], [8-11], [12-15]")
+        print(f"  gannina")
+        print(f"  TILE_PROCESSING_BENEFITS:")
+        print(f"    1. Level 0-3 cache: Load 15 nodes ONCE per tile")
+        print(f"    2. Flow overlap: vselect for batch[k+1] during hash of batch[k]")
+        print(f"    3. Better ILP: More independent ops in flight")
+        print(f"    4. Scheduler flexibility: 4 rounds of ops to schedule together")
+        print(f"  gannina")
+        print(f"  IMPLEMENTATION_PLAN:")
+        print(f"    STEP_1: Restructure main loop to tile-based")
+        print(f"    STEP_2: Emit ALL ops for rounds 0-3 for batch_k before flush")
+        print(f"    STEP_3: Let scheduler interleave across rounds")
+        print(f"    STEP_4: Add Level 3 cache + vselect mux")
+        print(f"  gannina")
+        print(f"  EXPECTED_CYCLES_REDUCTION:")
+        print(f"    Current: 2095 (sequential)")
+        print(f"    With tile: ~1600-1700 (estimated - flow hidden)")
+        print(f"    With Level 0-3 cache: ~1400-1500 (load reduction)")
+        print(f"    Target: 1363")
+        print(f"  gannina")
+        print(f"  NEXT_SESSION_ACTION:")
+        print(f"    1. IMPLEMENT tile loop structure (this is CRITICAL)")
+        print(f"    2. MEASURE cycles with tile processing")
+        print(f"    3. THEN add Level 3 vselect mux")
         print(f"  gannina")
         
         # ===== GANNINA PHASE 28: 110SPEEDUP ARCHITECTURE ANALYSIS ===== gannina

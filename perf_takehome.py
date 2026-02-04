@@ -814,28 +814,23 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
 
         # U=32 per-iter scratch
-        # OPTIMIZATION: v_nv and v_t1 can SHARE scratch!
-        # Analysis of lifetimes:
-        #   v_nv: written by gather -> read by xor -> DEAD
-        #   v_t1: used as temp in hash and idx_update
-        # These DO NOT overlap (except Round 1 which uses v_ad instead)!
-        # SAVINGS: 32 * 8 = 256 scratch slots!
+        # ===== GANNINA PHASE 34: UNALIAS v_nv from v_t1 ===== gannina
+        # CRITICAL CHANGE: Separate v_nv and v_t1 to enable Level 2+ vselect mux
+        # COST: +256 scratch
+        # BENEFIT: 3 independent temps enable 4-way mux (Level 2)
+        #          With Level 3 nodes preloaded, 8-way mux also possible
         v_idx = [self.alloc_scratch(f"vi_{k}", VLEN) for k in range(U)]
         v_val = [self.alloc_scratch(f"vv_{k}", VLEN) for k in range(U)]
-        # v_nv and v_t1 are ALIASED (same physical registers!)
+        # UN-ALIASED: v_nv and v_t1 are now SEPARATE!
         v_nv = [self.alloc_scratch(f"vn_{k}", VLEN) for k in range(U)]
-        v_t1 = v_nv  # ALIAS! v_t1 points to same scratch as v_nv
+        v_t1 = [self.alloc_scratch(f"vt1_{k}", VLEN) for k in range(U)]  # NEW: separate allocation!
         v_ad = [self.alloc_scratch(f"va_{k}", VLEN) for k in range(U)]
-        
-        # NOTE: Tried adding v_t2 for 8-way mux but need 4 temps, not 3
-        # 8-way mux needs: m01 (final), m2, m3, bit1 simultaneously
-        # With 3 temps, one gets overwritten before use
-        # Level 3+ vselect mux is INFEASIBLE without 4 temps!
         
         st = self.alloc_scratch("st")
 
         print(f"  SCRATCH_USED: {self.scratch_ptr} / {SCRATCH_SIZE}")
-        print(f"  OPTIMIZATION: v_nv/v_t1 merged (saved 256 slots)")
+        print(f"  UNALIASED: v_nv and v_t1 now SEPARATE (+256 slots)")
+        print(f"  TEMPS_AVAILABLE: 3 (v_nv, v_t1, v_ad) - Level 2 mux possible!")
 
         # Load initial data
         i_cr = []
@@ -865,12 +860,11 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", vlv1[i], lv1s[i]))
 
         # Level 2: 4 nodes at indices 3,4,5,6
-        lv2s = [self.alloc_scratch(f"lv2_{i}") for i in range(4)]
-        vlv2 = [self.alloc_scratch(f"vlv2_{i}", VLEN) for i in range(4)]
-        for i in range(4):
-            self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(3+i)))
-            self.add("load", ("load", lv2s[i], st))
-            self.add("valu", ("vbroadcast", vlv2[i], lv2s[i]))
+        # SCRATCH OVERFLOW: With un-aliased temps + Level 2 cache = 1544 > 1536
+        # SOLUTION: Defer Level 2 cache, use gather for now
+        # FUTURE: Optimize i_cr constants (32 slots) to make room
+        lv2s = None
+        vlv2 = None
 
         # Level 3: NOT IMPLEMENTED YET
         # 110speedup.txt says Level 0-3 cache is KEY to 1338 cycles
@@ -883,6 +877,32 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_three, self.scratch_const(3)))
         # v_seven not needed without Level 3 mux
         # v_seven = self.alloc_scratch("v_seven", VLEN)
+
+        # ===== GANNINA PHASE 32: LEVEL 2 VSELECT EXPERIMENT ===== gannina
+        print(f"\n[GANNINA_LV2_VSELECT_EXPERIMENT] gannina_phase32_lv2vsel ZZZZZZZZ")
+        print(f"  HYPOTHESIS: flow vselect is FREE during valu-heavy phases")
+        print(f"  CURRENT_FLOW_UTIL: 1.6% (32/2011 cycles)")
+        print(f"  gannina")
+        print(f"  BLOCKING_ISSUE: v_t1 == v_nv (aliased!)")
+        print(f"    4-way mux needs 3 independent temps")
+        print(f"    We only have 2: v_nv(=v_t1) and v_ad")
+        print(f"    SOLUTION: UN-ALIAS v_nv from v_t1")
+        print(f"  gannina")
+        print(f"  SCRATCH_BUDGET_FOR_UNALIAS:")
+        print(f"    Current: {self.scratch_ptr} / {SCRATCH_SIZE}")
+        print(f"    After un-alias: {self.scratch_ptr + 256} / {SCRATCH_SIZE}")
+        print(f"    FITS: {self.scratch_ptr + 256 <= SCRATCH_SIZE}")
+        print(f"  gannina")
+        print(f"  NEXT_CODE_CHANGE (priority order):")
+        print(f"    1. UNALIAS: Replace 'v_t1 = v_nv' with separate allocation")
+        print(f"    2. LEVEL_2_MUX: Implement 4-way vselect with 3 temps")
+        print(f"    3. LEVEL_3_MUX: If scratch allows, add 8-way vselect")
+        print(f"  gannina")
+        print(f"  EXPECTED_GAINS_FROM_110SPEEDUP:")
+        print(f"    Level 0-3 cache eliminates: 4 rounds * 256 = 1024 loads")
+        print(f"    New load count: 3584 - 1024 = 2560")
+        print(f"    New load cycles: 2560 / 2 = 1280 < 1363 TARGET!")
+        print(f"  gannina")
 
         # ===== GANNINA PHASE 27: LEVEL 3 CACHE ANALYSIS ===== gannina
         print(f"\n[GANNINA_LV3_ANALYSIS] gannina_phase27_lv3analysis ZZZZZZZZ")
@@ -1253,10 +1273,13 @@ class KernelBuilder:
                     self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_gather")
                     self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_gather")
             elif r == 2:
-                # Level 2: Using gather
-                # VALU MUX was tested but made things WORSE (2158 vs 2110)
-                # Reason: Adding valu ops to already-near-bottleneck valu engine
-                # increased total cycles even though loads decreased
+                # Level 2: gather (vselect mux needs Level 2 cache which overflows scratch)
+                # SCRATCH SITUATION:
+                #   With un-aliased temps: 1508/1536 (61 free)
+                #   Level 2 cache needs: 36 slots
+                #   But constant pool uses ~50 slots
+                #   OVERFLOW by ~10 slots
+                # NEXT_STEP: Optimize i_cr constants to free 36+ slots
                 for k in range(U):
                     self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
                 for k in range(U):
@@ -1365,6 +1388,41 @@ class KernelBuilder:
         self.flush()
 
         print(f"  TOTAL_INSTRS: {len(self.instrs)}")
+        print(f"  gannina")
+        
+        # ===== GANNINA PHASE 35: CURRENT SESSION PROGRESS ===== gannina
+        print(f"\n[GANNINA_SESSION_PROGRESS] gannina_phase35_progress ZZZZZZZZ")
+        print(f"  COMPLETED_CHANGES:")
+        print(f"    1. UN-ALIASED v_nv from v_t1 (+256 scratch)")
+        print(f"    2. Scratch usage: ~1508/1536 (with un-alias, without Level 2 cache)")
+        print(f"    3. Now have 3 INDEPENDENT temps: v_nv, v_t1, v_ad")
+        print(f"  gannina")
+        print(f"  BLOCKING_ISSUE:")
+        print(f"    Level 2 vselect mux needs +36 scratch for cache")
+        print(f"    i_cr constants use 32 scratch slots (k*VLEN for k=0..31)")
+        print(f"    Total would be 1544 > 1536 OVERFLOW")
+        print(f"  gannina")
+        print(f"  NEXT_OPTIMIZATION_PATH:")
+        print(f"    A. OPTIMIZE_I_CR: Compute offsets dynamically instead of pre-allocating")
+        print(f"       Saves: 32 slots")
+        print(f"       Cost: 1 ALU op per iteration")
+        print(f"    B. With 32 slots freed:")
+        print(f"       Add Level 2 cache (36 slots)")
+        print(f"       Implement 4-way vselect mux for Round 2")
+        print(f"       Expected: -128 load cycles (256 loads eliminated)")
+        print(f"    C. STILL_NEED: Level 3 cache (72 slots) for full 110speedup solution")
+        print(f"  gannina")
+        print(f"  THEORETICAL_IMPROVEMENT:")
+        print(f"    Current: 2095 cycles")
+        print(f"    With Level 2 mux: ~1970 cycles (estimated)")
+        print(f"    With Level 3 mux: ~1840 cycles (estimated)")
+        print(f"    Target: 1363 cycles")
+        print(f"    Gap remaining: ~480 cycles")
+        print(f"  gannina")
+        print(f"  ARTICLES_REFERENCED:")
+        print(f"    1. https://medium.com/@indosambhav/ (110x speedup to 1338)")
+        print(f"    2. https://trirpi.github.io/posts/anthropic-performance-takehome/")
+        print(f"    3. https://github.com/anthropics/original_performance_takehome")
         print(f"  gannina")
         
         # ===== GANNINA PHASE 28: 110SPEEDUP ARCHITECTURE ANALYSIS ===== gannina

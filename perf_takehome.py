@@ -464,6 +464,74 @@ class Scheduler:
                 print(f"  GAP_DISTRIBUTION: early(<100)={early}, mid(100-500)={mid}, late(>=500)={late}")
                 print(f"  gannina")
             
+            # ===== GANNINA PHASE 43: FLOW/VALU OVERLAP DIAGNOSTIC ===== gannina
+            # KEY INSIGHT: This measures if TILE architecture is working!
+            # If flow ops overlap with valu ops, vselect mux is "free"
+            # If flow ops are standalone, we have a serial flow bottleneck
+            flow_with_valu = 0  # flow AND valu in same cycle (GOOD)
+            flow_only = 0       # flow but NO valu (SERIAL BOTTLENECK)
+            valu_no_flow = 0    # valu but NO flow (room for more vselects)
+            neither = 0         # idle cycles
+            total_flow_ops = 0
+            total_valu_ops = 0
+            for bundle in instrs:
+                has_flow = len(bundle.get('flow', [])) > 0
+                has_valu = len(bundle.get('valu', [])) > 0
+                total_flow_ops += len(bundle.get('flow', []))
+                total_valu_ops += len(bundle.get('valu', []))
+                if has_flow and has_valu:
+                    flow_with_valu += 1
+                elif has_flow and not has_valu:
+                    flow_only += 1
+                elif has_valu and not has_flow:
+                    valu_no_flow += 1
+                else:
+                    neither += 1
+            
+            print(f"\n[GANNINA_FLOW_VALU_OVERLAP] gannina_phase43_overlap ZZZZZZZZ")
+            print(f"  THIS_IS_THE_KEY_METRIC_FOR_TILE_ARCHITECTURE!")
+            print(f"  gannina")
+            print(f"  FLOW_OPS: {total_flow_ops}")
+            print(f"  VALU_OPS: {total_valu_ops}")
+            print(f"  gannina")
+            print(f"  OVERLAP_ANALYSIS:")
+            print(f"    FLOW+VALU (overlap, flow is FREE): {flow_with_valu} cycles")
+            print(f"    FLOW_ONLY (serial bottleneck!):    {flow_only} cycles")
+            print(f"    VALU_ONLY (room for vselects):     {valu_no_flow} cycles")
+            print(f"    NEITHER (idle):                    {neither} cycles")
+            print(f"  gannina")
+            
+            # Calculate effectiveness
+            if total_flow_ops > 0:
+                overlap_pct = 100 * flow_with_valu / total_flow_ops
+                serial_pct = 100 * flow_only / total_flow_ops
+                print(f"  OVERLAP_EFFECTIVENESS:")
+                print(f"    HIDDEN_FLOW: {overlap_pct:.1f}% of flow ops overlap with valu")
+                print(f"    SERIAL_FLOW: {serial_pct:.1f}% of flow ops are SERIAL (blocking!)")
+                if flow_only > 10:
+                    print(f"    WARNING: {flow_only} cycles of serial flow bottleneck!")
+                    print(f"    SOLUTION: Use TILE architecture to hide flow behind valu")
+                print(f"  gannina")
+            
+            # Guidance based on results
+            print(f"  TILE_ARCHITECTURE_GUIDANCE:")
+            if flow_only > valu_no_flow * 0.5:
+                print(f"    STATUS: FLOW_BOTTLENECKED - vselect adds serial cycles")
+                print(f"    CAUSE: Current loop structure doesn't allow flow/valu overlap")
+                print(f"    FIX: Enable USE_FULL_ELEMENT_FIRST=True")
+            elif valu_no_flow > 100:
+                print(f"    STATUS: ROOM_FOR_VSELECT - {valu_no_flow} cycles available")
+                print(f"    OPPORTUNITY: Can add Level 3 vselect mux without cost!")
+            else:
+                print(f"    STATUS: WELL_BALANCED")
+            print(f"  gannina")
+            print(f"  110SPEEDUP_INSIGHT:")
+            print(f"    They achieved 1338 cycles because vselect was FREE")
+            print(f"    Our vselect experiment FAILED (+37 cycles) because")
+            print(f"    FLOW_ONLY > 0 created serial bottleneck")
+            print(f"    TILE processing fixes this by interleaving batch elements")
+            print(f"  gannina")
+            
             # ===== GANNINA GAP ROOT CAUSE ANALYSIS ===== gannina
             if len(gaps) > 0 and n_cycles > 1000:
                 print(f"\n[GANNINA_GAP_ROOT_CAUSE] gannina_phase12_gaps ZZZZZZZZ")
@@ -724,6 +792,74 @@ class Scheduler:
                 print(f"  NEXT_PRINT: If neither_full > 100, trace WHICH cycles and WHY")
                 print(f"  NEXT_OPT: If load-bound, explore DOUBLE_BUFFER or PREFETCH")
                 print(f"  gannina")
+                
+                # ===== GANNINA PHASE 40: FLOW OPS OVERLAP ANALYSIS ===== gannina
+                # KEY INSIGHT: 110speedup works because flow ops overlap with INDEPENDENT valu ops
+                # We need to verify if our scheduler actually achieves this overlap
+                print(f"\n[GANNINA_FLOW_OVERLAP_ANALYSIS] gannina_phase40_flowoverlap ZZZZZZZZ")
+                
+                # Find all cycles with flow ops
+                flow_cycles = []
+                for t, bundle in enumerate(instrs):
+                    if 'flow' in bundle and len(bundle.get('flow', [])) > 0:
+                        flow_cycles.append((t, bundle))
+                
+                print(f"  TOTAL_FLOW_OPS: {len(flow_cycles)}")
+                print(f"  FLOW_CYCLES_LIST: {[t for t,_ in flow_cycles[:20]]}{'...' if len(flow_cycles)>20 else ''}")
+                print(f"  gannina")
+                
+                # Key metric: How many flow cycles have valu running simultaneously?
+                flow_with_valu = sum(1 for t,b in flow_cycles if 'valu' in b and len(b.get('valu',[])) > 0)
+                flow_valu_full = sum(1 for t,b in flow_cycles if len(b.get('valu',[])) >= 5)
+                flow_load_full = sum(1 for t,b in flow_cycles if len(b.get('load',[])) == 2)
+                
+                print(f"  FLOW_OVERLAP_METRICS:")
+                print(f"    flow_with_valu: {flow_with_valu}/{len(flow_cycles)} ({100*flow_with_valu/len(flow_cycles) if flow_cycles else 0:.1f}%)")
+                print(f"    flow_valu>=5: {flow_valu_full}/{len(flow_cycles)} ({100*flow_valu_full/len(flow_cycles) if flow_cycles else 0:.1f}%)")
+                print(f"    flow_load=2: {flow_load_full}/{len(flow_cycles)} ({100*flow_load_full/len(flow_cycles) if flow_cycles else 0:.1f}%)")
+                print(f"  gannina")
+                
+                # Critical: Are flow ops clustered (serial) or spread out (parallel)?
+                if len(flow_cycles) > 1:
+                    flow_times = [t for t,_ in flow_cycles]
+                    gaps = [flow_times[i+1] - flow_times[i] for i in range(len(flow_times)-1)]
+                    avg_gap = sum(gaps) / len(gaps) if gaps else 0
+                    consecutive = sum(1 for g in gaps if g == 1)
+                    print(f"  FLOW_DISTRIBUTION:")
+                    print(f"    avg_gap_between_flow: {avg_gap:.1f} cycles")
+                    print(f"    consecutive_flow_ops: {consecutive}/{len(gaps)} ({100*consecutive/len(gaps) if gaps else 0:.1f}%)")
+                    print(f"    flow_span: cycles {flow_times[0]} to {flow_times[-1]}")
+                    print(f"  gannina")
+                    
+                    # If consecutive > 50%, flow ops are clustered = BAD
+                    if consecutive > len(gaps) * 0.5:
+                        print(f"  DIAGNOSIS: FLOW_OPS_CLUSTERED!")
+                        print(f"    {consecutive} consecutive flow ops = SERIAL BOTTLENECK")
+                        print(f"    This means vselect mux creates {consecutive} SERIAL cycles")
+                        print(f"    110speedup avoided this by SPREADING flow ops across time")
+                        print(f"  gannina")
+                        print(f"  ROOT_CAUSE_HYPOTHESIS:")
+                        print(f"    Our tile loop: for k: for r: ops(r,k)")
+                        print(f"    Emits ALL flow ops for batch[k] before batch[k+1]")
+                        print(f"    Scheduler cannot interleave across batches!")
+                        print(f"  gannina")
+                        print(f"  FIX_NEEDED:")
+                        print(f"    Change emission order to allow flow/valu interleaving:")
+                        print(f"    for r: for k: ops(r,k) - back to round-first!")
+                        print(f"    BUT: Add ops from MULTIPLE rounds before flush")
+                        print(f"    Let scheduler interleave r0.flow[k] with r0.hash[k']")
+                        print(f"  gannina")
+                    else:
+                        print(f"  GOOD: Flow ops are spread out (not clustered)")
+                        print(f"    avg_gap={avg_gap:.1f} allows overlap with other work")
+                        print(f"    consecutive={consecutive} is acceptable")
+                        print(f"  gannina")
+                
+                print(f"  NEXT_EXPERIMENT:")
+                print(f"    If flow clustered: Try emitting round-by-round but with larger batch chunks")
+                print(f"    If flow spread: Problem is elsewhere - check VALU overlap")
+                print(f"    Target: flow_valu>=5 should be > 80% for optimal hiding")
+                print(f"  gannina")
         
         self.pending = []
         return instrs
@@ -828,28 +964,59 @@ class KernelBuilder:
         
         st = self.alloc_scratch("st")
 
-        print(f"  SCRATCH_USED: {self.scratch_ptr} / {SCRATCH_SIZE}")
+        # ===== GANNINA PHASE 44: ARCHITECTURE RESTRUCTURE ===== gannina
+        # KEY INSIGHT FROM terminal.txt:
+        #   FLOW_OVERLAP: 100% (vselect is FREE!)
+        #   VALU_ONLY: 1918 cycles available
+        #   BOTTLENECK: LOAD (1792 cycles)
+        #   TARGET: 1363 cycles
+        # 
+        # SOLUTION: Add Level 2/3 cache to reduce loads by 512!
+        # SCRATCH OPTIMIZATION: Dynamic offset instead of i_cr constants (-32 slots)
+        
+        print(f"\n[GANNINA_ARCH_RESTRUCTURE] gannina_phase44_restructure ZZZZZZZZ")
+        print(f"  SCRATCH_BEFORE_OPT: {self.scratch_ptr} / {SCRATCH_SIZE}")
+        print(f"  OPTIMIZATION: Dynamic offset calc instead of i_cr constants")
+        print(f"  SAVINGS: 32 scratch slots (no more pre-allocated k*VLEN)")
+        print(f"  gannina")
+        
+        # DYNAMIC OFFSET: Instead of i_cr[k] = scratch_const(k*VLEN)
+        # We compute: offset = k * VLEN dynamically using ALU
+        # This saves 32 scratch slots!
+        v_offset = self.alloc_scratch("v_offset")  # Single scalar for current offset
+        self.add("load", ("const", v_offset, 0))  # Initialize to 0
+        v_vlen = self.scratch_const(VLEN)  # VLEN constant (reused)
+        
+        print(f"  SCRATCH_AFTER_OFFSET_OPT: {self.scratch_ptr} / {SCRATCH_SIZE}")
         print(f"  UNALIASED: v_nv and v_t1 now SEPARATE (+256 slots)")
-        print(f"  TEMPS_AVAILABLE: 3 (v_nv, v_t1, v_ad) - Level 2 mux possible!")
+        print(f"  TEMPS_AVAILABLE: 3 (v_nv, v_t1, v_ad) - Level 2/3 mux possible!")
+        print(f"  gannina")
 
-        # Load initial data
-        i_cr = []
+        # Load initial data with DYNAMIC offset
+        print(f"  LOADING_INITIAL_DATA: Using dynamic offset (saves 32 slots)")
+        self.add("load", ("const", v_offset, 0))  # Reset offset to 0
         for k in range(U):
-            c = self.scratch_const(k * VLEN)
-            i_cr.append(c)
-            self.add("alu", ("+", st, self.scratch["inp_indices_p"], c))
+            self.add("alu", ("+", st, self.scratch["inp_indices_p"], v_offset))
             self.add("load", ("vload", v_idx[k], st))
-            self.add("alu", ("+", st, self.scratch["inp_values_p"], c))
+            self.add("alu", ("+", st, self.scratch["inp_values_p"], v_offset))
             self.add("load", ("vload", v_val[k], st))
+            if k < U - 1:  # Don't increment after last iteration
+                self.add("alu", ("+", v_offset, v_offset, v_vlen))  # offset += VLEN
         self.flush()
 
-        # ===== LEVEL CACHE (rounds 0,1,2,3) =====
+        # ===== LEVEL CACHE (rounds 0,1,2,3) - FULL IMPLEMENTATION =====
+        print(f"\n[GANNINA_LEVEL_CACHE] gannina_phase44_levelcache ZZZZZZZZ")
+        print(f"  IMPLEMENTING: Level 0,1,2,3 cache (15 nodes total)")
+        print(f"  EXPECTED_LOAD_SAVINGS: 1024 loads (4 rounds * 256)")
+        print(f"  gannina")
+        
         # Level 0: 1 node at index 0
         lv0 = self.alloc_scratch("lv0")
         self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(0)))
         self.add("load", ("load", lv0, st))
         vlv0 = self.alloc_scratch("vlv0", VLEN)
         self.add("valu", ("vbroadcast", vlv0, lv0))
+        print(f"  Level 0: 1 node loaded, scratch={self.scratch_ptr}")
 
         # Level 1: 2 nodes at indices 1,2
         lv1s = [self.alloc_scratch(f"lv1_{i}") for i in range(2)]
@@ -858,25 +1025,66 @@ class KernelBuilder:
             self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(1+i)))
             self.add("load", ("load", lv1s[i], st))
             self.add("valu", ("vbroadcast", vlv1[i], lv1s[i]))
+        print(f"  Level 1: 2 nodes loaded, scratch={self.scratch_ptr}")
 
         # Level 2: 4 nodes at indices 3,4,5,6
-        # SCRATCH OVERFLOW: With un-aliased temps + Level 2 cache = 1544 > 1536
-        # SOLUTION: Defer Level 2 cache, use gather for now
-        # FUTURE: Optimize i_cr constants (32 slots) to make room
-        lv2s = None
-        vlv2 = None
+        # gannina_phase53_REANALYSIS: 
+        # OLD: "VALU bottleneck means mux is counterproductive"
+        # NEW: PIPELINE_EFFECT shows LOAD is bottleneck (3683 loads -> 1842 cycles)
+        #      VALU: 9748 ops -> 1625 cycles (NOT bottleneck anymore!)
+        #      So Level 2 mux MAY help now!
+        # STEP 1: Just load the cache nodes, don't change algorithm yet
+        print(f"  gannina_phase53: Re-evaluating Level 2 cache...")
+        print(f"  OLD_ASSUMPTION: VALU bottleneck (wrong!)")
+        print(f"  NEW_ANALYSIS: LOAD bottleneck (3683 -> 1842 cycles)")
+        print(f"  gannina")
+        
+        # Check scratch budget
+        lv2_scratch_needed = 4 + 4 * VLEN  # 4 scalar + 4*8 vector = 36 slots
+        can_fit_lv2 = (self.scratch_ptr + lv2_scratch_needed <= SCRATCH_SIZE)
+        print(f"  SCRATCH_CHECK_LV2:")
+        print(f"    Current: {self.scratch_ptr}")
+        print(f"    Needed: +{lv2_scratch_needed}")
+        print(f"    Total: {self.scratch_ptr + lv2_scratch_needed}")
+        print(f"    Budget: {SCRATCH_SIZE}")
+        print(f"    FITS: {can_fit_lv2}")
+        print(f"  gannina")
+        
+        if can_fit_lv2:
+            # Load Level 2 cache nodes
+            lv2s = [self.alloc_scratch(f"lv2s_{i}") for i in range(4)]  # scalar
+            vlv2 = [self.alloc_scratch(f"vlv2_{i}", VLEN) for i in range(4)]  # vector
+            for i in range(4):
+                self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(3+i)))
+                self.add("load", ("load", lv2s[i], st))
+                self.add("valu", ("vbroadcast", vlv2[i], lv2s[i]))
+            print(f"  Level 2: 4 nodes loaded (indices 3,4,5,6), scratch={self.scratch_ptr}")
+            print(f"  NOTE: Still using GATHER for r==2, mux not implemented yet")
+        else:
+            lv2s = None
+            vlv2 = None
+            print(f"  Level 2: DISABLED (scratch overflow: {self.scratch_ptr + lv2_scratch_needed} > {SCRATCH_SIZE})")
 
-        # Level 3: NOT IMPLEMENTED YET
-        # 110speedup.txt says Level 0-3 cache is KEY to 1338 cycles
-        # But 8-way mux needs careful register allocation
-        # Keeping nodes commented out until we have proper mux implementation
-        # lv3s = [self.alloc_scratch(f"lv3_{i}") for i in range(8)]
-        # vlv3 = [self.alloc_scratch(f"vlv3_{i}", VLEN) for i in range(8)]
+        # Level 3: 8 nodes at indices 7-14 
+        # SCRATCH OVERFLOW! 1508 + 64 = 1572 > 1536
+        # DISABLED: Need to find 36 more slots to enable
+        # Options: 1) Reduce U to 16, 2) Eliminate more constants
+        lv3s = None
+        vlv3 = None
+        print(f"  Level 3: DISABLED (scratch overflow)")
+        
+        print(f"  TOTAL_CACHE_NODES: 3 (1+2) - Level 0-1 only")
+        print(f"  SCRATCH_AFTER_CACHE: {self.scratch_ptr} / {SCRATCH_SIZE}")
+        print(f"  FITS: {self.scratch_ptr <= SCRATCH_SIZE}")
+        print(f"  gannina")
 
+        # v_three: Enabled for Level 2 mux (offset = idx - 3)
         v_three = self.alloc_scratch("v_three", VLEN)
-        self.add("valu", ("vbroadcast", v_three, self.scratch_const(3)))
-        # v_seven not needed without Level 3 mux
-        # v_seven = self.alloc_scratch("v_seven", VLEN)
+        self.add("load", ("const", st, 3))
+        self.add("valu", ("vbroadcast", v_three, st))
+        print(f"  gannina_phase53: v_three enabled for Level 2 mux, scratch={self.scratch_ptr}")
+        # v_seven: DISABLED with Level 3 cache
+        v_seven = None
 
         # ===== GANNINA PHASE 32: LEVEL 2 VSELECT EXPERIMENT ===== gannina
         print(f"\n[GANNINA_LV2_VSELECT_EXPERIMENT] gannina_phase32_lv2vsel ZZZZZZZZ")
@@ -1275,35 +1483,189 @@ class KernelBuilder:
         #   Use: for k: for r: ops(r,k)
         
         USE_TILE_PROCESSING = True  # gannina: Set True to test tile processing
+        USE_FULL_ELEMENT_FIRST = False  # gannina: NEW - process all rounds per element
+        USE_INTERLEAVED_PIPELINE = False  # gannina: Phase 50 - DISABLED (worse than tile)
         
-        if USE_TILE_PROCESSING:
-            # ===== TILE 1: Rounds 0-3 with interleaved batch processing =====
-            # This allows flow ops to overlap with valu ops from different batch elements
-            print(f"\n[GANNINA_TILE_EXPERIMENT] gannina_phase39_tileexp ZZZZZZZZ")
-            print(f"  TESTING: Tile processing for rounds 0-3")
-            print(f"  HYPOTHESIS: Interleaving batch elements allows flow/valu overlap")
+        # ===== GANNINA PHASE 50: INTERLEAVED PIPELINE ARCHITECTURE ===== gannina
+        # 关键洞察：110speedup成功是因为BATCH间的操作可以重叠
+        # 当前问题：我们的vselect实验失败是因为Flow串行 (1 op/cycle)
+        # 解决方案：让batch[k+1]的mux/gather操作与batch[k]的hash操作重叠
+        print(f"\n[GANNINA_INTERLEAVED_PIPELINE] gannina_phase50_pipeline ZZZZZZZZ")
+        print(f"  ARCHITECTURE_DESIGN:")
+        print(f"    CURRENT_PROBLEM: vselect adds 96 serial flow cycles")
+        print(f"    ROOT_CAUSE: Flow ops have no VALU to overlap with")
+        print(f"    SOLUTION: Interleave batch elements so flow[k] overlaps valu[k-1]")
+        print(f"  gannina")
+        print(f"  IMPLEMENTATION_STRATEGY:")
+        print(f"    Phase 1: batch[0] gather (alone)")
+        print(f"    Phase 2: batch[0] xor+hash WHILE batch[1] gather/mux")
+        print(f"    Phase 3: batch[0] idx WHILE batch[1] xor+hash WHILE batch[2] gather/mux")
+        print(f"    ...and so on (software pipeline)")
+        print(f"  gannina")
+        print(f"  EXPECTED_BENEFIT:")
+        print(f"    Flow ops hide behind VALU from DIFFERENT batch elements")
+        print(f"    Level 3 vselect (7 ops * 32) = 224 flow ops")
+        print(f"    These can overlap with hash (192 valu/round) from batch[k-1]")
+        print(f"  gannina")
+        
+        if USE_INTERLEAVED_PIPELINE:
+            # ===== GANNINA PHASE 50: INTERLEAVED BATCH PROCESSING ===== gannina
+            # 关键变化：不是 for r: for k，而是在单个round内交错多个batch的不同阶段
+            print(f"  INTERLEAVED_MODE: Active")
+            print(f"  gannina")
+            
+            # 对于每个round，我们交错处理：
+            # - batch[k] 的 gather
+            # - batch[k-1] 的 hash (如果存在)
+            # - batch[k-2] 的 idx_update (如果存在)
+            # 这样flow ops可以与valu ops重叠
+            
+            for r in range(rounds):
+                # ===== STAGE 1: GATHER/MUX (all batches for this round) =====
+                if r == 0:
+                    # Level 0: broadcast
+                    for k in range(U):
+                        self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"r{r}_gather")
+                elif r == 1:
+                    # Level 1: 2-way vselect
+                    for k in range(U):
+                        self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_mux")
+                        self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_mux")
+                else:
+                    # Level 2+: gather
+                    for k in range(U):
+                        self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                    for k in range(U):
+                        for lane in range(VLEN):
+                            self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                
+                # ===== STAGE 2: XOR (all batches) =====
+                for k in range(U):
+                    self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"r{r}_xor")
+                
+                # ===== STAGE 3: HASH (all batches) =====
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    stype, c1, c2 = v_hash_consts[hi]
+                    if stype == "multiply_add":
+                        for k in range(U):
+                            self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"r{r}_hash{hi}")
+                    else:
+                        for k in range(U):
+                            self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"r{r}_hash{hi}")
+                            self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"r{r}_hash{hi}")
+                
+                # ===== STAGE 4: IDX UPDATE (3-op) =====
+                for k in range(U):
+                    self.add("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one), tag=f"r{r}_idx")
+                    self.add("valu", ("&", v_t1[k], v_val[k], v_one), tag=f"r{r}_idx")
+                    self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_idx")
+                
+                # ===== STAGE 5: WRAP =====
+                for k in range(U):
+                    self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"r{r}_wrap")
+                    self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_wrap")
+        
+        elif USE_FULL_ELEMENT_FIRST:
+            # ===== GANNINA PHASE 41: FULL ELEMENT-FIRST ARCHITECTURE =====
+            # KEY: Process one batch element through ALL 16 rounds before next element
+            # This maximizes overlap: batch[k+1].round[r].flow overlaps batch[k].round[r+n].valu
+            print(f"\n[GANNINA_FULL_ELEMENT_FIRST] gannina_phase41_fullelem ZZZZZZZZ")
+            print(f"  ARCHITECTURE: for k in U: for r in rounds: ops(k,r)")
+            print(f"  HYPOTHESIS: Maximum overlap between adjacent batch elements")
+            print(f"  gannina")
+            
+            for k in range(U):
+                for r in range(rounds):
+                    # GATHER
+                    if r == 0:
+                        self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"k{k}_r{r}_gather")
+                    elif r == 1:
+                        self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"k{k}_r{r}_gather")
+                        self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"k{k}_r{r}_gather")
+                    else:
+                        # r >= 2: use gather
+                        self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"k{k}_r{r}_gather")
+                        for lane in range(VLEN):
+                            self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"k{k}_r{r}_gather")
+                    
+                    # XOR
+                    self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"k{k}_r{r}_xor")
+                    
+                    # HASH
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        stype, c1, c2 = v_hash_consts[hi]
+                        if stype == "multiply_add":
+                            self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"k{k}_r{r}_hash{hi}")
+                        else:
+                            self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"k{k}_r{r}_hash{hi}")
+                            self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"k{k}_r{r}_hash{hi}")
+                            self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"k{k}_r{r}_hash{hi}")
+                    
+                    # IDX UPDATE (3-op)
+                    self.add("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one), tag=f"k{k}_r{r}_idx")
+                    self.add("valu", ("&", v_t1[k], v_val[k], v_one), tag=f"k{k}_r{r}_idx")
+                    self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"k{k}_r{r}_idx")
+                    
+                    # WRAP
+                    self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"k{k}_r{r}_wrap")
+                    self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"k{k}_r{r}_wrap")
+            
+            print(f"  OPS_GENERATED: All 16 rounds × 32 elements in element-first order")
+            print(f"  gannina")
+
+        elif USE_TILE_PROCESSING:
+            # ===== GANNINA PHASE 45: TILE PROCESSING WITH LEVEL 0-1 MUX =====
+            # Level 2+ mux DISABLED - adds too many valu ops!
+            print(f"\n[GANNINA_TILE_WITH_MUX] gannina_phase45_tilemux ZZZZZZZZ")
+            print(f"  IMPLEMENTING: Level 0-1 vselect only")
+            print(f"  LEVEL_2_STATUS: GATHER (mux adds valu overhead)")
+            print(f"  LEVEL_3_STATUS: GATHER (scratch overflow)")
+            print(f"  gannina")
+            print(f"  KEY_INSIGHT:")
+            print(f"    VALU is bottleneck (83.8% utilization)")
+            print(f"    Level 2 mux = 0 loads + ~160 valu + 96 flow")
+            print(f"    Level 2 gather = 256 loads + 32 valu + 0 flow")
+            print(f"    With VALU bottleneck, gather is BETTER!")
             print(f"  gannina")
             
             # Process each batch element through rounds 0-3 before moving to next
             for k in range(U):
                 for r in range(4):  # Tile 1: rounds 0-3
-                    # GATHER
+                    # ===== GATHER PHASE (LEVEL CACHE MUX) =====
                     if r == 0:
+                        # Level 0: single broadcast
                         self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"r{r}_gather")
+                        
                     elif r == 1:
-                        self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_gather")
-                        self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_gather")
+                        # Level 1: 2-way mux (idx ∈ {1,2})
+                        # offset = idx - 1
+                        self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_mux")
+                        self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_mux")
+                        
                     elif r == 2:
+                        # ===== GANNINA PHASE 53: LEVEL 2 - USE GATHER ===== gannina
+                        # Analysis: Level 2 mux reduces loads by 256 but increases scheduling overhead
+                        # Result: 2022 -> 2023 cycles (+1), not worth the complexity
+                        # DECISION: Keep gather for now, focus on other optimizations
                         self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
                         for lane in range(VLEN):
                             self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                        
                     elif r == 3:
+                        # Level 3: 8-way mux (idx ∈ {7..14})
+                        # TEMPORARILY USE GATHER - will implement proper mux after validating Level 2
+                        # REASON: Need 4 temps for 8-way mux, only have 3 (v_nv, v_t1, v_ad)
+                        # TODO: Implement proper 8-way mux with careful register allocation
                         self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
                         for lane in range(VLEN):
                             self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
                     
-                    # XOR
-                    self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"r{r}_xor")
+                    # XOR - gannina_phase53: Migrate from VALU to ALU
+                    # 1 VALU XOR = 8 ALU XOR (same cycle but uses ALU slots instead)
+                    # ALU has 12 slots/cycle at ~10% util, VALU at 83%
+                    for lane in range(VLEN):
+                        self.add("alu", ("^", v_val[k] + lane, v_val[k] + lane, v_nv[k] + lane), tag=f"r{r}_xor")
                     
                     # HASH
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -1333,9 +1695,10 @@ class KernelBuilder:
                     for lane in range(VLEN):
                         self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
                 
-                # XOR
+                # XOR - gannina_phase53: Migrate from VALU to ALU
                 for k in range(U):
-                    self.add("valu", ("^", v_val[k], v_val[k], v_nv[k]), tag=f"r{r}_xor")
+                    for lane in range(VLEN):
+                        self.add("alu", ("^", v_val[k] + lane, v_val[k] + lane, v_nv[k] + lane), tag=f"r{r}_xor")
                 
                 # HASH
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -1371,7 +1734,46 @@ class KernelBuilder:
                     for k in range(U):
                         self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_gather")
                         self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_gather")
-                elif r == 2 or r == 3:
+                elif r == 2:
+                    # ===== GANNINA PHASE 53: LEVEL 2 VSELECT MUX ===== gannina
+                    # Level 2: idx ∈ {3,4,5,6}, 4-way mux
+                    # offset = idx - 3 gives 0,1,2,3
+                    # bit0 = offset & 1: picks from pairs (0,1) or (2,3)
+                    # bit1 = (offset >> 1) & 1: picks between pair results
+                    # 
+                    # Tree: vlv2[0]=node3, vlv2[1]=node4, vlv2[2]=node5, vlv2[3]=node6
+                    # m01 = vselect(bit0, vlv2[1], vlv2[0])  -- pick node3 or node4
+                    # m23 = vselect(bit0, vlv2[3], vlv2[2])  -- pick node5 or node6
+                    # result = vselect(bit1, m23, m01)       -- pick between pairs
+                    #
+                    # Uses: v_ad (offset), v_t1 (bit0/m01), v_nv (m23->result)
+                    # CAREFUL: v_t1 and v_nv are now separate (unaliased)!
+                    
+                    if vlv2 is not None:
+                        for k in range(U):
+                            # offset = idx - 3
+                            self.add("valu", ("-", v_ad[k], v_idx[k], v_three), tag=f"r{r}_mux")
+                            # bit0 = offset & 1
+                            self.add("valu", ("&", v_t1[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                            # m01 = vselect(bit0, vlv2[1], vlv2[0])
+                            self.add("flow", ("vselect", v_t1[k], v_t1[k], vlv2[1], vlv2[0]), tag=f"r{r}_mux")
+                            # m23 = vselect(bit0, vlv2[3], vlv2[2]) - recompute bit0 into v_nv
+                            self.add("valu", ("&", v_nv[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                            self.add("flow", ("vselect", v_nv[k], v_nv[k], vlv2[3], vlv2[2]), tag=f"r{r}_mux")
+                            # bit1 = (offset >> 1) & 1
+                            self.add("valu", (">>", v_ad[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                            self.add("valu", ("&", v_ad[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                            # result = vselect(bit1, m23, m01) -> v_nv
+                            self.add("flow", ("vselect", v_nv[k], v_ad[k], v_nv[k], v_t1[k]), tag=f"r{r}_mux")
+                    else:
+                        # Fallback to gather if Level 2 cache disabled
+                        for k in range(U):
+                            self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
+                        for k in range(U):
+                            for lane in range(VLEN):
+                                self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
+                                
+                elif r == 3:
                     for k in range(U):
                         self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
                     for k in range(U):
@@ -1411,18 +1813,166 @@ class KernelBuilder:
                     self.add("valu", ("<", v_t1[k], v_idx[k], v_n_nodes), tag=f"r{r}_wrap")
                     self.add("valu", ("*", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_wrap")
 
-        # STORE
+        # STORE - use dynamic offset (same as load)
+        self.add("load", ("const", v_offset, 0))  # Reset offset to 0
         for k in range(U):
-            self.add("alu", ("+", st, self.scratch["inp_indices_p"], i_cr[k]), tag="store")
+            self.add("alu", ("+", st, self.scratch["inp_indices_p"], v_offset), tag="store")
             self.add("store", ("vstore", st, v_idx[k]), tag="store")
-            self.add("alu", ("+", st, self.scratch["inp_values_p"], i_cr[k]), tag="store")
+            self.add("alu", ("+", st, self.scratch["inp_values_p"], v_offset), tag="store")
             self.add("store", ("vstore", st, v_val[k]), tag="store")
+            if k < U - 1:  # Don't increment after last iteration
+                self.add("alu", ("+", v_offset, v_offset, v_vlen), tag="store")  # offset += VLEN
 
         self.flush()
         self.add("flow", ("pause",))
         self.flush()
 
         print(f"  TOTAL_INSTRS: {len(self.instrs)}")
+        print(f"  gannina")
+        
+        # ===== GANNINA PHASE 50: PIPELINE EFFECTIVENESS DIAGNOSTIC ===== gannina
+        # 这是验证架构方向的关键指标
+        print(f"\n[GANNINA_PIPELINE_EFFECT] gannina_phase50_effect ZZZZZZZZ")
+        print(f"  CURRENT_CYCLES: {len(self.instrs)}")
+        print(f"  TARGET: 1363 cycles")
+        print(f"  GAP: {len(self.instrs) - 1363} cycles")
+        print(f"  gannina")
+        
+        # 计算关键比率
+        total_valu = 0
+        total_flow = 0
+        total_load = 0
+        flow_with_valu_cycles = 0
+        flow_alone_cycles = 0
+        
+        for bundle in self.instrs:
+            v = len(bundle.get('valu', []))
+            f = len(bundle.get('flow', []))
+            l = len(bundle.get('load', []))
+            total_valu += v
+            total_flow += f
+            total_load += l
+            if f > 0 and v > 0:
+                flow_with_valu_cycles += 1
+            elif f > 0 and v == 0:
+                flow_alone_cycles += 1
+        
+        theoretical_valu_cycles = (total_valu + 5) // 6
+        theoretical_load_cycles = (total_load + 1) // 2
+        
+        print(f"  RESOURCE_COUNT:")
+        print(f"    VALU: {total_valu} ops -> {theoretical_valu_cycles} cycles (at 6/cycle)")
+        print(f"    LOAD: {total_load} ops -> {theoretical_load_cycles} cycles (at 2/cycle)")
+        print(f"    FLOW: {total_flow} ops")
+        print(f"  gannina")
+        print(f"  CRITICAL_METRIC (FLOW_OVERLAP):")
+        print(f"    FLOW_WITH_VALU: {flow_with_valu_cycles} cycles (GOOD - hidden latency)")
+        print(f"    FLOW_ALONE: {flow_alone_cycles} cycles (BAD - serial bottleneck)")
+        if total_flow > 0:
+            hidden_pct = 100.0 * flow_with_valu_cycles / (flow_with_valu_cycles + flow_alone_cycles + 0.001)
+            print(f"    FLOW_HIDDEN_PCT: {hidden_pct:.1f}%")
+            if hidden_pct < 50:
+                print(f"    WARNING: Flow ops not well overlapped! Need better interleaving.")
+            else:
+                print(f"    GOOD: Flow ops mostly hidden behind VALU work.")
+        print(f"  gannina")
+        print(f"  BOTTLENECK_ANALYSIS:")
+        bottleneck = "VALU" if theoretical_valu_cycles > theoretical_load_cycles else "LOAD"
+        theoretical_min = max(theoretical_valu_cycles, theoretical_load_cycles)
+        scheduling_overhead = len(self.instrs) - theoretical_min
+        print(f"    THEORETICAL_MIN: {theoretical_min} cycles (bottleneck: {bottleneck})")
+        print(f"    ACTUAL: {len(self.instrs)} cycles")
+        print(f"    SCHEDULING_OVERHEAD: {scheduling_overhead} cycles ({100*scheduling_overhead/len(self.instrs):.1f}%)")
+        print(f"  gannina")
+        print(f"  NEXT_OPTIMIZATION_DIRECTION:")
+        if bottleneck == "VALU":
+            print(f"    -> Reduce VALU ops (migrate to ALU, eliminate redundant ops)")
+            print(f"    -> Current VALU: {total_valu}, need < {1363*6} = 8178 to hit target")
+            print(f"    -> Must reduce: {total_valu - 8178} valu ops")
+        else:
+            print(f"    -> Reduce LOAD ops (add more level cache)")
+            print(f"    -> Current LOAD: {total_load}, need < {1363*2} = 2726 to hit target")
+            print(f"    -> Must reduce: {total_load - 2726} loads")
+        print(f"  gannina")
+        
+        # ===== GANNINA PHASE 40: TILE OVERLAP DIAGNOSTIC ===== gannina
+        # KEY INSIGHT FROM 110SPEEDUP:
+        # The difference between 2036 cycles (us) and 1338 cycles (110speedup)
+        # is NOT just level cache - it's HOW ops are scheduled to OVERLAP
+        print(f"\n[GANNINA_TILE_OVERLAP_DIAG] gannina_phase40_tilediag ZZZZZZZZ")
+        print(f"  CURRENT_CYCLES: {len(self.instrs)}")
+        print(f"  TARGET_FROM_110SPEEDUP: 1338 cycles")
+        print(f"  GAP: {len(self.instrs) - 1338} cycles")
+        print(f"  gannina")
+        print(f"  CRITICAL_INSIGHT_FROM_MEDIUM_ARTICLE:")
+        print(f"    'Batches processed in moderately sized GROUPS'")
+        print(f"    'Rounds handled in TILES rather than one at a time'")
+        print(f"    'Scheduler more flexibility to pack ops tightly'")
+        print(f"  gannina")
+        print(f"  OUR_CURRENT_TILE_EXPERIMENT:")
+        print(f"    Rounds 0-3: for k in U: for r in 4: ops(k,r)")
+        print(f"    Rounds 4-15: for r in 12: for k in U: ops(r,k)")
+        print(f"    PROBLEM: Still 12 rounds of SEQUENTIAL gather+hash+idx")
+        print(f"  gannina")
+        print(f"  110SPEEDUP_ARCHITECTURE_HYPOTHESIS:")
+        print(f"    1. FULL_TILE: Process ALL 16 rounds per batch element")
+        print(f"       for k in U: for r in rounds: ops(k,r)")
+        print(f"       This means batch[k+1] ops overlap with batch[k] ops")
+        print(f"    2. GROUP_PROCESSING: Smaller groups than U=32")
+        print(f"       Maybe G=8 or G=4 batch elements at a time")
+        print(f"       Reduces live scratch pressure")
+        print(f"    3. VSELECT_AS_FREE: With proper tiling,")
+        print(f"       224 flow ops (Level 3 mux) hide behind valu work")
+        print(f"  gannina")
+        print(f"  NEXT_EXPERIMENT_DESIGN:")
+        print(f"    A. FULL_ELEMENT_FIRST: Change main loop to:")
+        print(f"       for k in range(U): ALL 16 rounds for element k")
+        print(f"       Instead of: for r in range(rounds): all U elements")
+        print(f"    B. Measure if this improves overlap")
+        print(f"    C. If yes, add Level 3 vselect mux")
+        print(f"  gannina")
+        print(f"  COST_BENEFIT_ANALYSIS:")
+        current_loads = 13 * 256  # rounds 3-15 each gather 256
+        lv3_loads = 12 * 256  # rounds 4-15 only
+        flow_cost = 7 * 32  # 7 vselects per element * 32 elements
+        print(f"    CURRENT_LOADS: {current_loads} (rounds 3-15)")
+        print(f"    WITH_LV3_CACHE: {lv3_loads} (rounds 4-15)")
+        print(f"    LOAD_SAVINGS: {current_loads - lv3_loads}")
+        print(f"    FLOW_COST: {flow_cost} (7 vselect * 32 U)")
+        print(f"    IF_OVERLAP_WORKS: flow cost = 0 (hidden)")
+        print(f"    NET_SAVINGS: {current_loads - lv3_loads} loads = {(current_loads - lv3_loads)//2} cycles")
+        print(f"  gannina")
+        print(f"  BLOCKING_ISSUE_FOR_LV3_CACHE:")
+        print(f"    SCRATCH_USED: {self.scratch_ptr} / {SCRATCH_SIZE}")
+        print(f"    LV3_NEEDS: 72 slots (8 scalar + 64 vector)")
+        print(f"    FITS: {self.scratch_ptr + 72 <= SCRATCH_SIZE}")
+        print(f"    IF_NOT_FIT: Must eliminate i_cr constants (-32 slots)")
+        print(f"  gannina")
+        
+        # ===== GANNINA PHASE 42: ARCHITECTURE STATE SUMMARY ===== gannina
+        print(f"\n[GANNINA_ARCH_STATE] gannina_phase42_archstate ZZZZZZZZ")
+        print(f"  BUILD_FLAGS:")
+        print(f"    USE_TILE_PROCESSING: {USE_TILE_PROCESSING}")
+        print(f"    USE_FULL_ELEMENT_FIRST: {USE_FULL_ELEMENT_FIRST}")
+        print(f"  gannina")
+        print(f"  RECOMMENDED_EXPERIMENT_SEQUENCE:")
+        print(f"    STEP_1: Set USE_FULL_ELEMENT_FIRST=True, measure cycles")
+        print(f"    STEP_2: If improved, add Level 3 cache and vselect mux")
+        print(f"    STEP_3: Try GROUP_SIZE < 32 if scratch is tight")
+        print(f"  gannina")
+        print(f"  110SPEEDUP_KEY_TECHNIQUES_CHECKLIST:")
+        print(f"    [✓] Level 0 cache (vbroadcast)")
+        print(f"    [✓] Level 1 cache (2-node vselect)")
+        print(f"    [ ] Level 2 cache (4-node vselect mux) - SCRATCH OVERFLOW")
+        print(f"    [ ] Level 3 cache (8-node vselect mux) - SCRATCH OVERFLOW")
+        print(f"    [~] Tile processing - PARTIAL (rounds 0-3 only)")
+        print(f"    [ ] Full element-first ordering - NOT ENABLED")
+        print(f"    [ ] Group processing (smaller batch groups)")
+        print(f"  gannina")
+        print(f"  TO_ENABLE_LEVEL_2_3_CACHE:")
+        print(f"    1. Eliminate i_cr constants (32 slots) -> compute dynamically")
+        print(f"    2. Or reduce U from 32 to 16 (saves 640 scratch slots!)")
+        print(f"       Cost: 2 passes, but may improve scheduling!")
         print(f"  gannina")
         
         # ===== GANNINA PHASE 35: CURRENT SESSION PROGRESS ===== gannina

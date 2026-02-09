@@ -403,8 +403,10 @@ class KernelBuilder:
                 for k in range(U):
                     for lane in range(VLEN):
                         self.add("alu", ("&", v_t1[k]+lane, v_val[k]+lane, v_one), tag=f"r{r}_idx")
+                # Use ALU for idx + odd to free VALU capacity
                 for k in range(U):
-                    self.add("valu", ("+", v_idx[k], v_idx[k], v_t1[k]), tag=f"r{r}_idx")
+                    for lane in range(VLEN):
+                        self.add("alu", ("+", v_idx[k]+lane, v_idx[k]+lane, v_t1[k]+lane), tag=f"r{r}_idx")
 
         # ===== GANNINA PHASE 92: OPERATION COUNT SUMMARY ===== gannina
         gather_rounds = sum(1 for r in range(rounds) if r % TREE_DEPTH >= 3)  

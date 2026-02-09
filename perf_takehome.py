@@ -111,23 +111,23 @@ class Scheduler:
         for i, op in enumerate(self.pending):
             op['id'] = i
         
-        # Build dependency graph
+        # Build dependency graph with typed edges
         successors = [[] for _ in range(n)]
-        predecessors = [[] for _ in range(n)]
+        predecessors = [[] for _ in range(n)]  # (pred_idx, dep_type)
         
         for i in range(n):
             for j in range(i+1, n):
                 op_i = self.pending[i]
                 op_j = self.pending[j]
-                if op_i['write'] & op_j['read']:  # RAW
-                    successors[i].append(j)
-                    predecessors[j].append(i)
-                elif op_i['write'] & op_j['write']:  # WAW
-                    successors[i].append(j)
-                    predecessors[j].append(i)
-                elif op_i['read'] & op_j['write']:  # WAR
-                    successors[i].append(j)
-                    predecessors[j].append(i)
+                has_raw = bool(op_i['write'] & op_j['read'])
+                has_waw = bool(op_i['write'] & op_j['write'])
+                has_war = bool(op_i['read'] & op_j['write'])
+                if has_raw or has_waw:
+                    successors[i].append((j, 'raw'))
+                    predecessors[j].append((i, 'raw'))
+                elif has_war:
+                    successors[i].append((j, 'war'))
+                    predecessors[j].append((i, 'war'))
         
         # Compute critical path lengths (upward rank)
         critical_len = [0] * n
@@ -137,18 +137,27 @@ class Scheduler:
         while ready:
             node = ready.pop()
             topo_order.append(node)
-            for succ in successors[node]:
+            for succ, dep_type in successors[node]:
                 in_degree[succ] -= 1
                 if in_degree[succ] == 0:
                     ready.append(succ)
         
         for node in reversed(topo_order):
             max_succ = 0
-            for succ in successors[node]:
+            for succ, dep_type in successors[node]:
                 max_succ = max(max_succ, critical_len[succ] + 1)
             critical_len[node] = max_succ
         
         sorted_ops = sorted(range(n), key=lambda i: (-critical_len[i], i))
+        
+        # ===== GANNINA PHASE 91.5: DEPENDENCY ANALYSIS ===== gannina
+        if n > 1000:
+            n_raw = sum(1 for i in range(n) for _, dt in successors[i] if dt == 'raw')
+            n_war = sum(1 for i in range(n) for _, dt in successors[i] if dt == 'war')
+            max_cp = max(critical_len) if critical_len else 0
+            print(f"[GANNINA_DEP_ANALYSIS] gannina")
+            print(f"  OPS={n} RAW={n_raw} WAR={n_war} CRIT_PATH={max_cp}")
+            print(f"gannina")
         
         schedule = defaultdict(list)
         resource_usage = defaultdict(lambda: defaultdict(int))
@@ -160,9 +169,12 @@ class Scheduler:
         for op_idx in sorted_ops:
             op = self.pending[op_idx]
             t_min = 0
-            for pred_idx in predecessors[op_idx]:
+            for pred_idx, dep_type in predecessors[op_idx]:
                 if pred_idx in op_scheduled_time:
-                    t_min = max(t_min, op_scheduled_time[pred_idx] + 1)
+                    if dep_type == 'war':
+                        t_min = max(t_min, op_scheduled_time[pred_idx])
+                    else:
+                        t_min = max(t_min, op_scheduled_time[pred_idx] + 1)
             for r in op['read']:
                 t_min = max(t_min, reg_avail[r])
             for r in op['write']:
@@ -446,12 +458,18 @@ class KernelBuilder:
         min_flow = total_flow
         bottleneck = max(min_valu, min_load, min_flow)
         
+        # Compute utilization per engine in final schedule
+        load_util = total_load / (n_cycles * 2) * 100 if n_cycles > 0 else 0
+        valu_util = total_valu / (n_cycles * 6) * 100 if n_cycles > 0 else 0
+        alu_util = total_alu / (n_cycles * 12) * 100 if n_cycles > 0 else 0
+        
         print(f"[GANNINA_PHASE93_FINAL] gannina")
         print(f"  SCHEDULED_CYCLES: {n_cycles}")
         print(f"  OPS: valu={total_valu} load={total_load} flow={total_flow} alu={total_alu}")
         print(f"  MIN: valu={min_valu} load={min_load} flow={min_flow}")
         print(f"  THEORETICAL_MIN: {bottleneck}")
         print(f"  OVERHEAD: {n_cycles - bottleneck} ({100*(n_cycles-bottleneck)/bottleneck:.1f}%)")
+        print(f"  UTIL: load={load_util:.1f}% valu={valu_util:.1f}% alu={alu_util:.1f}%")
         print(f"gannina")
 
 

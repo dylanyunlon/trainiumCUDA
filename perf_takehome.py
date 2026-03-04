@@ -255,8 +255,8 @@ class KernelBuilder:
                 for k in range(U):
                     body.append(("flow", ("vselect", v_nv[k], v_nv[k], vlv2[3], vlv2[2])))
                 for k in range(U):
+                    # v_ad was 0-3, so >>1 yields 0 or 1; &1 is redundant
                     body.append(("valu", (">>", v_ad[k], v_ad[k], v_one)))
-                    body.append(("valu", ("&", v_ad[k], v_ad[k], v_one)))
                 for k in range(U):
                     body.append(("flow", ("vselect", v_nv[k], v_ad[k], v_nv[k], v_t1[k])))
             else:

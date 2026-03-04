@@ -1,14 +1,19 @@
 """
-GANNINA Architecture v2 - Wrap-Aware Level Cache
-Key Insight: Tree traversal wraps every 10 rounds (tree height)
-So round r accesses tree level (r % (height+1))
-Caching levels 0-2 saves loads at rounds 0,1,2 AND 11,12,13!
-
-Current: 1992 cycles
-Target: <1363 cycles
+# Anthropic's Original Performance Engineering Take-home (Release version)
 
 Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
 to publish or redistribute your solutions so it's hard to find spoilers.
+
+# Task
+
+- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
+  available time, as measured by test_kernel_cycles on a frozen separate copy
+  of the simulator.
+
+Validate your results using `python tests/submission_tests.py` without modifying
+anything in the tests/ folder.
+
+We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
@@ -31,183 +36,6 @@ from problem import (
     reference_kernel2,
 )
 
-def get_rw(engine, slot):
-    reads = set()
-    writes = set()
-    def add_read(r, length=1):
-        for i in range(length):
-            reads.add(r + i)
-    def add_write(r, length=1):
-        for i in range(length):
-            writes.add(r + i)
-
-    if engine == "alu":
-        op, dest, a1, a2 = slot
-        add_read(a1); add_read(a2); add_write(dest)
-    elif engine == "valu":
-        op = slot[0]
-        if op == "vbroadcast":
-            _, dest, src = slot
-            add_read(src); add_write(dest, VLEN)
-        elif op == "multiply_add":
-            _, dest, a, b, c = slot
-            add_read(a, VLEN); add_read(b, VLEN); add_read(c, VLEN); add_write(dest, VLEN)
-        else:
-            _, dest, a1, a2 = slot
-            add_read(a1, VLEN); add_read(a2, VLEN); add_write(dest, VLEN)
-    elif engine == "load":
-        op = slot[0]
-        if op == "load":
-            _, dest, addr = slot
-            add_read(addr); add_write(dest)
-        elif op == "load_offset":
-            _, dest, addr_vec, offset = slot
-            add_read(addr_vec + offset); add_write(dest + offset)
-        elif op == "vload":
-            _, dest, addr = slot
-            add_read(addr); add_write(dest, VLEN)
-        elif op == "const":
-            _, dest, val = slot
-            add_write(dest)
-    elif engine == "store":
-        op = slot[0]
-        if op == "store":
-            _, addr, src = slot
-            add_read(addr); add_read(src)
-        elif op == "vstore":
-            _, addr, src = slot
-            add_read(addr); add_read(src, VLEN)
-    elif engine == "flow":
-        op = slot[0]
-        if op == "select":
-            _, dest, cond, a, b = slot
-            add_read(cond); add_read(a); add_read(b); add_write(dest)
-        elif op == "vselect":
-            _, dest, cond, a, b = slot
-            add_read(cond, VLEN); add_read(a, VLEN); add_read(b, VLEN); add_write(dest, VLEN)
-        elif op == "add_imm":
-            _, dest, a, imm = slot
-            add_read(a); add_write(dest)
-        elif op in ("halt", "pause"):
-            pass
-    return reads, writes
-
-
-class Scheduler:
-    def __init__(self):
-        self.pending = []
-
-    def add(self, engine, slot, tag=None):
-        if engine == "debug":
-            return
-        reads, writes = get_rw(engine, slot)
-        self.pending.append({'engine': engine, 'slot': slot, 'read': reads, 'write': writes, 'tag': tag})
-
-    def flush(self):
-        if not self.pending:
-            return []
-        
-        n = len(self.pending)
-        for i, op in enumerate(self.pending):
-            op['id'] = i
-        
-        # Build dependency graph with typed edges
-        successors = [[] for _ in range(n)]
-        predecessors = [[] for _ in range(n)]  # (pred_idx, dep_type)
-        
-        for i in range(n):
-            for j in range(i+1, n):
-                op_i = self.pending[i]
-                op_j = self.pending[j]
-                has_raw = bool(op_i['write'] & op_j['read'])
-                has_waw = bool(op_i['write'] & op_j['write'])
-                has_war = bool(op_i['read'] & op_j['write'])
-                if has_raw or has_waw:
-                    successors[i].append((j, 'raw'))
-                    predecessors[j].append((i, 'raw'))
-                elif has_war:
-                    successors[i].append((j, 'war'))
-                    predecessors[j].append((i, 'war'))
-        
-        # Compute critical path lengths (upward rank)
-        critical_len = [0] * n
-        in_degree = [len(predecessors[i]) for i in range(n)]
-        ready = [i for i in range(n) if in_degree[i] == 0]
-        topo_order = []
-        while ready:
-            node = ready.pop()
-            topo_order.append(node)
-            for succ, dep_type in successors[node]:
-                in_degree[succ] -= 1
-                if in_degree[succ] == 0:
-                    ready.append(succ)
-        
-        for node in reversed(topo_order):
-            max_succ = 0
-            for succ, dep_type in successors[node]:
-                max_succ = max(max_succ, critical_len[succ] + 1)
-            critical_len[node] = max_succ
-        
-        sorted_ops = sorted(range(n), key=lambda i: (-critical_len[i], i))
-        
-        # ===== GANNINA PHASE 91.5: DEPENDENCY ANALYSIS ===== gannina
-        if n > 1000:
-            n_raw = sum(1 for i in range(n) for _, dt in successors[i] if dt == 'raw')
-            n_war = sum(1 for i in range(n) for _, dt in successors[i] if dt == 'war')
-            max_cp = max(critical_len) if critical_len else 0
-            print(f"[GANNINA_DEP_ANALYSIS] gannina")
-            print(f"  OPS={n} RAW={n_raw} WAR={n_war} CRIT_PATH={max_cp}")
-            print(f"gannina")
-        
-        schedule = defaultdict(list)
-        resource_usage = defaultdict(lambda: defaultdict(int))
-        reg_avail = defaultdict(int)
-        reg_last_read = defaultdict(int)
-        reg_last_write = defaultdict(int)
-        op_scheduled_time = {}
-
-        for op_idx in sorted_ops:
-            op = self.pending[op_idx]
-            t_min = 0
-            for pred_idx, dep_type in predecessors[op_idx]:
-                if pred_idx in op_scheduled_time:
-                    if dep_type == 'war':
-                        t_min = max(t_min, op_scheduled_time[pred_idx])
-                    else:
-                        t_min = max(t_min, op_scheduled_time[pred_idx] + 1)
-            for r in op['read']:
-                t_min = max(t_min, reg_avail[r])
-            for r in op['write']:
-                t_min = max(t_min, reg_last_read[r])
-            for r in op['write']:
-                if r in reg_last_write:
-                    t_min = max(t_min, reg_last_write[r] + 1)
-            t = t_min
-            while resource_usage[t][op['engine']] >= SLOT_LIMITS[op['engine']]:
-                t += 1
-            schedule[t].append(op)
-            resource_usage[t][op['engine']] += 1
-            op_scheduled_time[op_idx] = t
-            for r in op['write']:
-                reg_avail[r] = t + 1
-                reg_last_write[r] = t
-            for r in op['read']:
-                reg_last_read[r] = max(reg_last_read[r], t)
-
-        instrs = []
-        if schedule:
-            for t in range(max(schedule.keys()) + 1):
-                bundle = {}
-                for op in schedule[t]:
-                    e = op['engine']
-                    if e not in bundle:
-                        bundle[e] = []
-                    bundle[e].append(op['slot'])
-                instrs.append(bundle)
-        
-        self.pending = []
-        return instrs
-
 
 class KernelBuilder:
     def __init__(self):
@@ -216,16 +44,19 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
-        self.scheduler = Scheduler()
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def add(self, engine, slot, tag=None):
-        self.scheduler.add(engine, slot, tag)
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        # Simple slot packing that just uses one slot per instruction bundle
+        instrs = []
+        for engine, slot in slots:
+            instrs.append({engine: [slot]})
+        return instrs
 
-    def flush(self):
-        self.instrs.extend(self.scheduler.flush())
+    def add(self, engine, slot):
+        self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -233,7 +64,7 @@ class KernelBuilder:
             self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
-        assert self.scratch_ptr <= SCRATCH_SIZE, f"Out of scratch: {self.scratch_ptr}/{SCRATCH_SIZE}"
+        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
     def scratch_const(self, val, name=None):
@@ -243,263 +74,465 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
-        U = 32
-        TREE_DEPTH = forest_height + 1  # 11 for height=10
+    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+        slots = []
 
-        # Init params
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+
+        return slots
+    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
+        from collections import defaultdict
+
+        U = batch_size // VLEN
+        TREE_DEPTH = forest_height + 1
+
+        # ================================================================
+        # INIT SECTION - collect all init loads, then pack 2 per cycle
+        # ================================================================
         tmp_init = self.alloc_scratch("tmp_init")
-        init_vars = ["rounds","n_nodes","batch_size","forest_height",
-                      "forest_values_p","inp_indices_p","inp_values_p"]
+        init_vars = [
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
+        ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        
+        # Collect init loads instead of emitting them one at a time
+        init_loads = []
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp_init, i))
-            self.add("load", ("load", self.scratch[v], tmp_init))
+            init_loads.append(("const", tmp_init, i))
+            init_loads.append(("load", self.scratch[v], tmp_init))
 
-        # Vector constants
-        v_zero = self.alloc_scratch("v_zero", VLEN)
-        self.add("valu", ("vbroadcast", v_zero, self.scratch_const(0)))
-        v_one = self.alloc_scratch("v_one", VLEN)
-        self.add("valu", ("vbroadcast", v_one, self.scratch_const(1)))
-        v_two = self.alloc_scratch("v_two", VLEN)
-        self.add("valu", ("vbroadcast", v_two, self.scratch_const(2)))
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
+        # Override scratch_const to collect instead of emit
+        _saved_add = self.add
+        init_const_loads = []
+        def collect_add(engine, slot):
+            if engine == "load":
+                init_const_loads.append(slot)
+            else:
+                _saved_add(engine, slot)
+        self.add = collect_add
+        
+        # Pre-create ALL scalar constants during init
+        zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+        three_const = self.scratch_const(3)
+        vlen_const = self.scratch_const(VLEN)
 
-        # Hash constants
-        v_hash_consts = []
+        # Hash scalar constants
+        hash_info = []
         for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op1 == "+" and op2 == "+" and op3 == "<<":
-                mul_const = (1 + (1 << val3)) % (2**32)
-                v_mul = self.alloc_scratch(f"v_hmul_{i}", VLEN)
-                v_add = self.alloc_scratch(f"v_hadd_{i}", VLEN)
-                self.add("valu", ("vbroadcast", v_mul, self.scratch_const(mul_const)))
-                self.add("valu", ("vbroadcast", v_add, self.scratch_const(val1)))
-                v_hash_consts.append(("multiply_add", v_mul, v_add))
+                mul_c = (1 + (1 << val3)) % (2**32)
+                sc_mul = self.scratch_const(mul_c)
+                sc_add = self.scratch_const(val1)
+                hash_info.append(("multiply_add", sc_mul, sc_add))
             else:
-                v_c1 = self.alloc_scratch(f"v_hc1_{i}", VLEN)
-                v_c3 = self.alloc_scratch(f"v_hc3_{i}", VLEN)
-                self.add("valu", ("vbroadcast", v_c1, self.scratch_const(val1)))
-                self.add("valu", ("vbroadcast", v_c3, self.scratch_const(val3)))
-                v_hash_consts.append(("3op", v_c1, v_c3))
+                sc_c1 = self.scratch_const(val1)
+                sc_c3 = self.scratch_const(val3)
+                hash_info.append(("3op", sc_c1, sc_c3))
 
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
-        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        # Level-cache offset constants (0..6)
+        for offset in range(7):
+            self.scratch_const(offset)
 
-        # Per-element scratch: separate v_nv from v_t1 for mux operations
+        # Restore original add
+        self.add = _saved_add
+        
+        # Save init loads to prepend to body after it's created
+        _init_var_loads = []
+        for i, v in enumerate(init_vars):
+            _init_var_loads.append(("load", ("const", tmp_init, i)))
+            _init_var_loads.append(("load", ("load", self.scratch[v], tmp_init)))
+        _all_init_loads = _init_var_loads + [("load", cl) for cl in init_const_loads]
+
+        # ================================================================
+        # BODY SECTION - collected as list, scheduled by embedded scheduler
+        # ================================================================
+        body = []
+        
+        # Prepend init loads so scheduler manages them
+        body.extend(_all_init_loads)
+
+        # --- Vector constants ---
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        body.append(("valu", ("vbroadcast", v_zero, zero_const)))
+        v_one = self.alloc_scratch("v_one", VLEN)
+        body.append(("valu", ("vbroadcast", v_one, one_const)))
+        v_two = self.alloc_scratch("v_two", VLEN)
+        body.append(("valu", ("vbroadcast", v_two, two_const)))
+        v_three = self.alloc_scratch("v_three", VLEN)
+        body.append(("valu", ("vbroadcast", v_three, three_const)))
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        body.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
+
+        # --- Vector hash constants ---
+        v_hash_consts = []
+        for i, (stype, sc1, sc2) in enumerate(hash_info):
+            vc1 = self.alloc_scratch(f"v_hc1_{i}", VLEN)
+            vc2 = self.alloc_scratch(f"v_hc2_{i}", VLEN)
+            body.append(("valu", ("vbroadcast", vc1, sc1)))
+            body.append(("valu", ("vbroadcast", vc2, sc2)))
+            v_hash_consts.append((stype, vc1, vc2))
+
+        # --- Per-element vector scratch ---
         v_idx = [self.alloc_scratch(f"vi_{k}", VLEN) for k in range(U)]
         v_val = [self.alloc_scratch(f"vv_{k}", VLEN) for k in range(U)]
-        v_nv = [self.alloc_scratch(f"vn_{k}", VLEN) for k in range(U)]
-        v_t1 = [self.alloc_scratch(f"vt1_{k}", VLEN) for k in range(U)]
-        v_ad = [self.alloc_scratch(f"va_{k}", VLEN) for k in range(U)]
-        
+        v_nv  = [self.alloc_scratch(f"vn_{k}", VLEN) for k in range(U)]
+        v_t1  = [self.alloc_scratch(f"vt1_{k}", VLEN) for k in range(U)]
+        v_ad  = [self.alloc_scratch(f"va_{k}", VLEN) for k in range(U)]
+
         st = self.alloc_scratch("st")
-
-        # Dynamic offset for load/store
         v_offset = self.alloc_scratch("v_offset")
-        self.add("load", ("const", v_offset, 0))
-        v_vlen = self.scratch_const(VLEN)
-        
-        # Load initial data
-        self.add("load", ("const", v_offset, 0))
+
+        # --- Load initial idx and val vectors ---
+        body.append(("load", ("const", v_offset, 0)))
         for k in range(U):
-            self.add("alu", ("+", st, self.scratch["inp_indices_p"], v_offset))
-            self.add("load", ("vload", v_idx[k], st))
-            self.add("alu", ("+", st, self.scratch["inp_values_p"], v_offset))
-            self.add("load", ("vload", v_val[k], st))
+            body.append(("alu", ("+", st, self.scratch["inp_indices_p"], v_offset)))
+            body.append(("load", ("vload", v_idx[k], st)))
+            body.append(("alu", ("+", st, self.scratch["inp_values_p"], v_offset)))
+            body.append(("load", ("vload", v_val[k], st)))
             if k < U - 1:
-                self.add("alu", ("+", v_offset, v_offset, v_vlen))
-        self.flush()
+                body.append(("alu", ("+", v_offset, v_offset, vlen_const)))
 
-        # ===== LEVEL CACHE =====
-        # Level 0: 1 node
+        # --- Level cache: pre-load and broadcast levels 0, 1, 2 ---
         lv0 = self.alloc_scratch("lv0")
-        self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(0)))
-        self.add("load", ("load", lv0, st))
         vlv0 = self.alloc_scratch("vlv0", VLEN)
-        self.add("valu", ("vbroadcast", vlv0, lv0))
+        body.append(("alu", ("+", st, self.scratch["forest_values_p"], self.const_map[0])))
+        body.append(("load", ("load", lv0, st)))
+        body.append(("valu", ("vbroadcast", vlv0, lv0)))
 
-        # Level 1: 2 nodes
         lv1s = [self.alloc_scratch(f"lv1_{i}") for i in range(2)]
         vlv1 = [self.alloc_scratch(f"vlv1_{i}", VLEN) for i in range(2)]
         for i in range(2):
-            self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(1+i)))
-            self.add("load", ("load", lv1s[i], st))
-            self.add("valu", ("vbroadcast", vlv1[i], lv1s[i]))
+            body.append(("alu", ("+", st, self.scratch["forest_values_p"], self.const_map[1 + i])))
+            body.append(("load", ("load", lv1s[i], st)))
+            body.append(("valu", ("vbroadcast", vlv1[i], lv1s[i])))
 
-        # Level 2: 4 nodes
         lv2s = [self.alloc_scratch(f"lv2s_{i}") for i in range(4)]
         vlv2 = [self.alloc_scratch(f"vlv2_{i}", VLEN) for i in range(4)]
         for i in range(4):
-            self.add("alu", ("+", st, self.scratch["forest_values_p"], self.scratch_const(3+i)))
-            self.add("load", ("load", lv2s[i], st))
-            self.add("valu", ("vbroadcast", vlv2[i], lv2s[i]))
+            body.append(("alu", ("+", st, self.scratch["forest_values_p"], self.const_map[3 + i])))
+            body.append(("load", ("load", lv2s[i], st)))
+            body.append(("valu", ("vbroadcast", vlv2[i], lv2s[i])))
 
-        v_three = self.alloc_scratch("v_three", VLEN)
-        self.add("load", ("const", st, 3))
-        self.add("valu", ("vbroadcast", v_three, st))
-
-        # ===== GANNINA PHASE 90: SCRATCH BUDGET ===== gannina
-        print(f"[GANNINA_PHASE90_SCRATCH] gannina")
-        print(f"  SCRATCH: used={self.scratch_ptr}/{SCRATCH_SIZE}, free={SCRATCH_SIZE - self.scratch_ptr}")
-        print(f"gannina")
-        
-        self.flush()
-
-        # ===== GANNINA PHASE 91: WRAP-AWARE LEVEL CACHE WITH INTERLEAVED EMISSION =====
-        # KEY OPTIMIZATION: Emit round r's gather alongside round r-1's hash/idx/wrap
-        # This lets the scheduler overlap loads with independent compute
-        
+        # --- Main loop ---
         for r in range(rounds):
             level = r % TREE_DEPTH
-            
-            # ===== STAGE 1: NODE VALUE LOOKUP =====
+
+            # STAGE 1: NODE VALUE LOOKUP
             if level == 0:
                 for k in range(U):
-                    self.add("valu", ("+", v_nv[k], vlv0, v_zero), tag=f"r{r}_gather")
+                    body.append(("valu", ("+", v_nv[k], vlv0, v_zero)))
             elif level == 1:
                 for k in range(U):
-                    self.add("valu", ("-", v_ad[k], v_idx[k], v_one), tag=f"r{r}_mux")
+                    body.append(("valu", ("-", v_ad[k], v_idx[k], v_one)))
                 for k in range(U):
-                    self.add("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0]), tag=f"r{r}_mux")
+                    body.append(("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0])))
             elif level == 2:
                 for k in range(U):
-                    self.add("valu", ("-", v_ad[k], v_idx[k], v_three), tag=f"r{r}_mux")
-                    self.add("valu", ("&", v_t1[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                    body.append(("valu", ("-", v_ad[k], v_idx[k], v_three)))
+                    body.append(("valu", ("&", v_t1[k], v_ad[k], v_one)))
                 for k in range(U):
-                    self.add("flow", ("vselect", v_t1[k], v_t1[k], vlv2[1], vlv2[0]), tag=f"r{r}_mux")
+                    body.append(("flow", ("vselect", v_t1[k], v_t1[k], vlv2[1], vlv2[0])))
                 for k in range(U):
-                    self.add("valu", ("&", v_nv[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                    body.append(("valu", ("&", v_nv[k], v_ad[k], v_one)))
                 for k in range(U):
-                    self.add("flow", ("vselect", v_nv[k], v_nv[k], vlv2[3], vlv2[2]), tag=f"r{r}_mux")
+                    body.append(("flow", ("vselect", v_nv[k], v_nv[k], vlv2[3], vlv2[2])))
                 for k in range(U):
-                    self.add("valu", (">>", v_ad[k], v_ad[k], v_one), tag=f"r{r}_mux")
-                    self.add("valu", ("&", v_ad[k], v_ad[k], v_one), tag=f"r{r}_mux")
+                    body.append(("valu", (">>", v_ad[k], v_ad[k], v_one)))
+                    body.append(("valu", ("&", v_ad[k], v_ad[k], v_one)))
                 for k in range(U):
-                    self.add("flow", ("vselect", v_nv[k], v_ad[k], v_nv[k], v_t1[k]), tag=f"r{r}_mux")
+                    body.append(("flow", ("vselect", v_nv[k], v_ad[k], v_nv[k], v_t1[k])))
             else:
-                # Level 3+: gather - emit address calc for ALL elements first
                 for k in range(U):
-                    self.add("valu", ("+", v_ad[k], v_forest_p, v_idx[k]), tag=f"r{r}_gather")
-                # Then emit loads interleaved with previous round's leftover work
+                    body.append(("valu", ("+", v_ad[k], v_forest_p, v_idx[k])))
                 for k in range(U):
                     for lane in range(VLEN):
-                        self.add("load", ("load_offset", v_nv[k], v_ad[k], lane), tag=f"r{r}_gather")
-            
-            # ===== STAGE 2: XOR (use ALU to free VALU) =====
+                        body.append(("load", ("load_offset", v_nv[k], v_ad[k], lane)))
+
+            # STAGE 2: XOR via scalar ALU
             for k in range(U):
                 for lane in range(VLEN):
-                    self.add("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane), tag=f"r{r}_xor")
-            
-            # ===== STAGE 3: HASH =====
+                    body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
+
+            # STAGE 3: HASH
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 stype, c1, c2 = v_hash_consts[hi]
                 if stype == "multiply_add":
                     for k in range(U):
-                        self.add("valu", ("multiply_add", v_val[k], v_val[k], c1, c2), tag=f"r{r}_hash{hi}")
+                        body.append(("valu", ("multiply_add", v_val[k], v_val[k], c1, c2)))
                 else:
                     for k in range(U):
-                        self.add("valu", (op1, v_t1[k], v_val[k], c1), tag=f"r{r}_hash{hi}")
-                        self.add("valu", (op3, v_ad[k], v_val[k], c2), tag=f"r{r}_hash{hi}")
-                        self.add("valu", (op2, v_val[k], v_t1[k], v_ad[k]), tag=f"r{r}_hash{hi}")
-            
-            # ===== STAGE 4: IDX UPDATE =====
+                        body.append(("valu", (op1, v_t1[k], v_val[k], c1)))
+                        body.append(("valu", (op3, v_ad[k], v_val[k], c2)))
+                        body.append(("valu", (op2, v_val[k], v_t1[k], v_ad[k])))
+
+            # STAGE 4: IDX UPDATE
             if level + 1 >= TREE_DEPTH:
-                # Wrap round: idx will be set to 0, so skip the expensive idx computation
                 for k in range(U):
-                    self.add("valu", ("+", v_idx[k], v_zero, v_zero), tag=f"r{r}_wrap")
+                    body.append(("valu", ("+", v_idx[k], v_zero, v_zero)))
             else:
                 for k in range(U):
-                    self.add("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one), tag=f"r{r}_idx")
+                    body.append(("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one)))
                 for k in range(U):
                     for lane in range(VLEN):
-                        self.add("alu", ("&", v_t1[k]+lane, v_val[k]+lane, v_one), tag=f"r{r}_idx")
-                # Use ALU for idx + odd to free VALU capacity
+                        body.append(("alu", ("&", v_t1[k]+lane, v_val[k]+lane, v_one)))
                 for k in range(U):
                     for lane in range(VLEN):
-                        self.add("alu", ("+", v_idx[k]+lane, v_idx[k]+lane, v_t1[k]+lane), tag=f"r{r}_idx")
+                        body.append(("alu", ("+", v_idx[k]+lane, v_idx[k]+lane, v_t1[k]+lane)))
 
-        # ===== GANNINA PHASE 92: OPERATION COUNT SUMMARY ===== gannina
-        gather_rounds = sum(1 for r in range(rounds) if r % TREE_DEPTH >= 3)  
-        cached_rounds = rounds - gather_rounds
-        total_loads_expected = gather_rounds * U * VLEN
-        print(f"[GANNINA_PHASE92_WRAPAWARE] gannina")
-        print(f"  TREE_DEPTH: {TREE_DEPTH}")
-        print(f"  CACHED_ROUNDS: {cached_rounds} (levels 0,1,2)")
-        print(f"  GATHER_ROUNDS: {gather_rounds}")
-        print(f"  EXPECTED_LOADS: {total_loads_expected}")
-        print(f"  MIN_LOAD_CYCLES: {(total_loads_expected + 1) // 2}")
-        print(f"gannina")
-
-        # STORE
-        self.add("load", ("const", v_offset, 0))
+        # --- Store results ---
+        body.append(("load", ("const", v_offset, 0)))
         for k in range(U):
-            self.add("alu", ("+", st, self.scratch["inp_indices_p"], v_offset), tag="store")
-            self.add("store", ("vstore", st, v_idx[k]), tag="store")
-            self.add("alu", ("+", st, self.scratch["inp_values_p"], v_offset), tag="store")
-            self.add("store", ("vstore", st, v_val[k]), tag="store")
+            body.append(("alu", ("+", st, self.scratch["inp_indices_p"], v_offset)))
+            body.append(("store", ("vstore", st, v_idx[k])))
+            body.append(("alu", ("+", st, self.scratch["inp_values_p"], v_offset)))
+            body.append(("store", ("vstore", st, v_val[k])))
             if k < U - 1:
-                self.add("alu", ("+", v_offset, v_offset, v_vlen), tag="store")
+                body.append(("alu", ("+", v_offset, v_offset, vlen_const)))
 
-        self.flush()
-        self.add("flow", ("pause",))
-        self.flush()
+        # ================================================================
+        # EMBEDDED SCHEDULER - critical path priority, WAR-aware
+        # ================================================================
+        def get_rw(engine, slot):
+            reads = set()
+            writes = set()
+            if engine == "alu":
+                op, dest, a1, a2 = slot
+                reads.add(a1); reads.add(a2); writes.add(dest)
+            elif engine == "valu":
+                op = slot[0]
+                if op == "vbroadcast":
+                    _, dest, src = slot
+                    reads.add(src)
+                    for vi in range(VLEN): writes.add(dest + vi)
+                elif op == "multiply_add":
+                    _, dest, a, b, c = slot
+                    for vi in range(VLEN):
+                        reads.add(a+vi); reads.add(b+vi); reads.add(c+vi)
+                        writes.add(dest+vi)
+                else:
+                    _, dest, a1, a2 = slot
+                    for vi in range(VLEN):
+                        reads.add(a1+vi); reads.add(a2+vi)
+                        writes.add(dest+vi)
+            elif engine == "load":
+                op = slot[0]
+                if op == "load":
+                    _, dest, addr = slot
+                    reads.add(addr); writes.add(dest)
+                elif op == "load_offset":
+                    _, dest, addr_vec, offset = slot
+                    reads.add(addr_vec + offset); writes.add(dest + offset)
+                elif op == "vload":
+                    _, dest, addr = slot
+                    reads.add(addr)
+                    for vi in range(VLEN): writes.add(dest + vi)
+                elif op == "const":
+                    _, dest, val = slot
+                    writes.add(dest)
+            elif engine == "store":
+                op = slot[0]
+                if op == "store":
+                    _, addr, src = slot
+                    reads.add(addr); reads.add(src)
+                elif op == "vstore":
+                    _, addr, src = slot
+                    reads.add(addr)
+                    for vi in range(VLEN): reads.add(src + vi)
+            elif engine == "flow":
+                op = slot[0]
+                if op == "select":
+                    _, dest, cond, a, b = slot
+                    reads.add(cond); reads.add(a); reads.add(b); writes.add(dest)
+                elif op == "vselect":
+                    _, dest, cond, a, b = slot
+                    for vi in range(VLEN):
+                        reads.add(cond+vi); reads.add(a+vi); reads.add(b+vi)
+                        writes.add(dest+vi)
+                elif op == "add_imm":
+                    _, dest, a, imm = slot
+                    reads.add(a); writes.add(dest)
+            return reads, writes
 
-        # ===== GANNINA PHASE 93: FINAL DIAGNOSTICS ===== gannina
-        total_valu = sum(len(b.get('valu', [])) for b in self.instrs)
-        total_load = sum(len(b.get('load', [])) for b in self.instrs)
-        total_flow = sum(len(b.get('flow', [])) for b in self.instrs)
-        total_alu = sum(len(b.get('alu', [])) for b in self.instrs)
-        n_cycles = len(self.instrs)
-        
-        min_valu = (total_valu + 5) // 6
-        min_load = (total_load + 1) // 2
-        min_flow = total_flow
-        bottleneck = max(min_valu, min_load, min_flow)
-        
-        # Compute utilization per engine in final schedule
-        load_util = total_load / (n_cycles * 2) * 100 if n_cycles > 0 else 0
-        valu_util = total_valu / (n_cycles * 6) * 100 if n_cycles > 0 else 0
-        alu_util = total_alu / (n_cycles * 12) * 100 if n_cycles > 0 else 0
-        
-        print(f"[GANNINA_PHASE93_FINAL] gannina")
-        print(f"  SCHEDULED_CYCLES: {n_cycles}")
-        print(f"  OPS: valu={total_valu} load={total_load} flow={total_flow} alu={total_alu}")
-        print(f"  MIN: valu={min_valu} load={min_load} flow={min_flow}")
-        print(f"  THEORETICAL_MIN: {bottleneck}")
-        print(f"  OVERHEAD: {n_cycles - bottleneck} ({100*(n_cycles-bottleneck)/bottleneck:.1f}%)")
-        print(f"  UTIL: load={load_util:.1f}% valu={valu_util:.1f}% alu={alu_util:.1f}%")
-        print(f"gannina")
+        n = len(body)
+        ops = []
+        for i, (eng, slot) in enumerate(body):
+            rd, wr = get_rw(eng, slot)
+            ops.append((eng, slot, rd, wr))
 
+        # Build dependency graph via per-register tracking
+        predecessors = [dict() for _ in range(n)]
+        successors = [dict() for _ in range(n)]
+
+        reg_last_writer = {}
+        reg_readers_since = defaultdict(list)
+
+        for i in range(n):
+            eng, slot, rd, wr = ops[i]
+
+            for r in rd:
+                w = reg_last_writer.get(r)
+                if w is not None:
+                    predecessors[i][w] = 'raw'
+                    successors[w][i] = 'raw'
+
+            for r in wr:
+                w = reg_last_writer.get(r)
+                if w is not None and w not in predecessors[i]:
+                    predecessors[i][w] = 'raw'
+                    successors[w][i] = 'raw'
+                for reader in reg_readers_since.get(r, []):
+                    if reader != i and reader not in predecessors[i]:
+                        predecessors[i][reader] = 'war'
+                        if i not in successors[reader]:
+                            successors[reader][i] = 'war'
+
+            for r in wr:
+                reg_last_writer[r] = i
+                reg_readers_since[r] = []
+            for r in rd:
+                reg_readers_since[r].append(i)
+
+        # Topological sort
+        in_deg = [len(predecessors[i]) for i in range(n)]
+        ready = [i for i in range(n) if in_deg[i] == 0]
+        topo = []
+        while ready:
+            node = ready.pop()
+            topo.append(node)
+            for succ in successors[node]:
+                in_deg[succ] -= 1
+                if in_deg[succ] == 0:
+                    ready.append(succ)
+
+        # Critical path (backward)
+        crit = [0] * n
+        for node in reversed(topo):
+            mx = 0
+            for succ in successors[node]:
+                c = crit[succ] + 1
+                if c > mx: mx = c
+            crit[node] = mx
+
+        sorted_ops = sorted(range(n), key=lambda i: (-crit[i], i))
+
+        schedule = defaultdict(list)
+        res_usage = defaultdict(lambda: defaultdict(int))
+        reg_avail = defaultdict(int)
+        reg_last_rd = defaultdict(int)
+        reg_last_wr = {}
+        op_time = {}
+
+        slot_limits = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1}
+
+        for idx in sorted_ops:
+            eng, slot, rd, wr = ops[idx]
+            t_min = 0
+            for pred, dtype in predecessors[idx].items():
+                pt = op_time[pred]
+                if dtype == 'war':
+                    if pt > t_min: t_min = pt
+                else:
+                    if pt + 1 > t_min: t_min = pt + 1
+            for r in rd:
+                ra = reg_avail.get(r, 0)
+                if ra > t_min: t_min = ra
+            for r in wr:
+                rl = reg_last_rd.get(r, 0)
+                if rl > t_min: t_min = rl
+            for r in wr:
+                lw = reg_last_wr.get(r)
+                if lw is not None and lw + 1 > t_min:
+                    t_min = lw + 1
+            t = t_min
+            while res_usage[t][eng] >= slot_limits[eng]:
+                t += 1
+            schedule[t].append((eng, slot))
+            res_usage[t][eng] += 1
+            op_time[idx] = t
+            for r in wr:
+                reg_avail[r] = t + 1
+                reg_last_wr[r] = t
+            for r in rd:
+                cur = reg_last_rd.get(r, 0)
+                if t > cur: reg_last_rd[r] = t
+
+        if schedule:
+            max_t = max(schedule.keys())
+            for t in range(max_t + 1):
+                bundle = {}
+                for eng, slot in schedule.get(t, []):
+                    if eng not in bundle:
+                        bundle[eng] = []
+                    bundle[eng].append(slot)
+                self.instrs.append(bundle)
+
+        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
-def do_kernel_test(forest_height, rounds, batch_size, seed=123, trace=False, prints=False):
+def do_kernel_test(
+    forest_height: int,
+    rounds: int,
+    batch_size: int,
+    seed: int = 123,
+    trace: bool = False,
+    prints: bool = False,
+):
+    print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
+
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    # print(kb.instrs)
+
     value_trace = {}
-    machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES,
-                      value_trace=value_trace, trace=trace)
+    machine = Machine(
+        mem,
+        kb.instrs,
+        kb.debug_info(),
+        n_cores=N_CORES,
+        value_trace=value_trace,
+        trace=trace,
+    )
     machine.prints = prints
-    ref_gen = reference_kernel2(mem, value_trace)
-    ref_mems = list(ref_gen)
-    machine.run()
-    ref_mem = ref_mems[-1]
-    inp_values_p = ref_mem[6]
-    assert (machine.mem[inp_values_p:inp_values_p+len(inp.values)]
-            == ref_mem[inp_values_p:inp_values_p+len(inp.values)]), f"Wrong values"
-    inp_indices_p = ref_mem[5]
-    assert (machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)]
-            == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]), f"Wrong indices"
+    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+        machine.run()
+        inp_values_p = ref_mem[6]
+        if prints:
+            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+        assert (
+            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+        ), f"Incorrect result on round {i}"
+        inp_indices_p = ref_mem[5]
+        if prints:
+            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+        # Updating these in memory isn't required, but you can enable this check for debugging
+        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+
+    print("CYCLES: ", machine.cycle)
+    print("Speedup over baseline: ", BASELINE / machine.cycle)
     return machine.cycle
+
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
+        """
+        Test the reference kernels against each other
+        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -508,16 +541,38 @@ class Tests(unittest.TestCase):
             reference_kernel(f, inp)
             for _ in reference_kernel2(mem, {}):
                 pass
-            assert inp.indices == mem[mem[5]:mem[5]+len(inp.indices)]
-            assert inp.values == mem[mem[6]:mem[6]+len(inp.values)]
+            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
+            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
+
+    def test_kernel_trace(self):
+        # Full-scale example for performance testing
+        do_kernel_test(10, 16, 256, trace=True, prints=False)
+
+    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
+    # You can uncomment this if you think it might help you debug
+    # def test_kernel_correctness(self):
+    #     for batch in range(1, 3):
+    #         for forest_height in range(3):
+    #             do_kernel_test(
+    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
+    #             )
 
     def test_kernel_cycles(self):
-        print(f"Testing forest_height=10, rounds=16, batch_size=256")
-        cycles = do_kernel_test(10, 16, 256)
-        print(f"CYCLES:  {cycles}")
-        speedup = BASELINE / cycles
-        print(f"Speedup over baseline:  {speedup}")
-        
+        do_kernel_test(10, 16, 256)
+
+
+# To run all the tests:
+#    python perf_takehome.py
+# To run a specific test:
+#    python perf_takehome.py Tests.test_kernel_cycles
+# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
+# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
+#    python perf_takehome.py Tests.test_kernel_trace
+# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
+# You can then keep that open and re-run the test to see a new trace.
+
+# To run the proper checks to see which thresholds you pass:
+#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()

@@ -188,37 +188,47 @@ class KernelBuilder:
         v_ad  = [self.alloc_scratch(f"va_{k}", VLEN) for k in range(U)]
 
         st = self.alloc_scratch("st")
+        st2 = self.alloc_scratch("st2")
         v_offset = self.alloc_scratch("v_offset")
 
         # --- Load initial idx and val vectors ---
+        # Compute idx and val addresses simultaneously using separate temporaries
         body.append(("load", ("const", v_offset, 0)))
         for k in range(U):
             body.append(("alu", ("+", st, self.scratch["inp_indices_p"], v_offset)))
+            body.append(("alu", ("+", st2, self.scratch["inp_values_p"], v_offset)))
             body.append(("load", ("vload", v_idx[k], st)))
-            body.append(("alu", ("+", st, self.scratch["inp_values_p"], v_offset)))
-            body.append(("load", ("vload", v_val[k], st)))
+            body.append(("load", ("vload", v_val[k], st2)))
             if k < U - 1:
                 body.append(("alu", ("+", v_offset, v_offset, vlen_const)))
 
         # --- Level cache: pre-load and broadcast levels 0, 1, 2 ---
         lv0 = self.alloc_scratch("lv0")
         vlv0 = self.alloc_scratch("vlv0", VLEN)
-        body.append(("alu", ("+", st, self.scratch["forest_values_p"], self.const_map[0])))
-        body.append(("load", ("load", lv0, st)))
-        body.append(("valu", ("vbroadcast", vlv0, lv0)))
+        lv_addr = [self.alloc_scratch(f"lv_addr_{i}") for i in range(7)]
+
+        body.append(("alu", ("+", lv_addr[0], self.scratch["forest_values_p"], self.const_map[0])))
+        for i in range(2):
+            body.append(("alu", ("+", lv_addr[1+i], self.scratch["forest_values_p"], self.const_map[1 + i])))
+        for i in range(4):
+            body.append(("alu", ("+", lv_addr[3+i], self.scratch["forest_values_p"], self.const_map[3 + i])))
+
+        body.append(("load", ("load", lv0, lv_addr[0])))
 
         lv1s = [self.alloc_scratch(f"lv1_{i}") for i in range(2)]
         vlv1 = [self.alloc_scratch(f"vlv1_{i}", VLEN) for i in range(2)]
         for i in range(2):
-            body.append(("alu", ("+", st, self.scratch["forest_values_p"], self.const_map[1 + i])))
-            body.append(("load", ("load", lv1s[i], st)))
-            body.append(("valu", ("vbroadcast", vlv1[i], lv1s[i])))
+            body.append(("load", ("load", lv1s[i], lv_addr[1+i])))
 
         lv2s = [self.alloc_scratch(f"lv2s_{i}") for i in range(4)]
         vlv2 = [self.alloc_scratch(f"vlv2_{i}", VLEN) for i in range(4)]
         for i in range(4):
-            body.append(("alu", ("+", st, self.scratch["forest_values_p"], self.const_map[3 + i])))
-            body.append(("load", ("load", lv2s[i], st)))
+            body.append(("load", ("load", lv2s[i], lv_addr[3+i])))
+
+        body.append(("valu", ("vbroadcast", vlv0, lv0)))
+        for i in range(2):
+            body.append(("valu", ("vbroadcast", vlv1[i], lv1s[i])))
+        for i in range(4):
             body.append(("valu", ("vbroadcast", vlv2[i], lv2s[i])))
 
         # --- Main loop ---

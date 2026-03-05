@@ -1,19 +1,6 @@
 # Performance Optimization Plan: trainiumCUDA → sub-1000 cycles
 
-## Current Status
-- **Score: 1370 cycles** (107.8x speedup over 147734 baseline)
-- **Target: <1001 cycles** (kerneloptimization.fun top tier)
-- **Recruiting threshold: 1487 cycles** ✅ (already passed)
-- **Claude Opus 4.5 best: 1363 cycles** (7 cycles away)
-- **Community best reported: ~1338 cycles** (Medium article by Indosambhav)
 
-## Architecture Bottleneck Analysis
-
-# Performance Optimization Plan: trainiumCUDA → Sub-1001 Cycles
-
-## Current Status: 1370 cycles (107.8x speedup over 147,734 baseline)
-
-### Critical Path Analysis
 
 The kernel is **95.8% load-bound**:
 - Load engine: 2625 ops, active 1301/1370 cycles at max capacity (2/2)

@@ -112,7 +112,7 @@ class SpeedTests(unittest.TestCase):
 
     def test_opus45_improved_harness(self):
         # Claude Opus 4.5 in an improved test time compute harness
-        assert cycles() < 1363
+        assert cycles() < 1002
 
 
 if __name__ == "__main__":

@@ -439,3 +439,120 @@ PR description should include:
 - ALU utilization (target: >80%)
 - Sparse cycle count (target: <30)
 - Scratch usage (target: maximize caching within 1536 limit)
+
+
+# Performance Optimization Plan: trainiumCUDA → sub-1001 cycles
+
+## Current Status: 1370 cycles (107.8x speedup over baseline 147734)
+
+## Architecture Profile (at 1370 cycles)
+
+| Engine | Slots/Cycle | Total Ops | Min Cycles | Utilization |
+|--------|------------|-----------|------------|-------------|
+| Load   | 2          | 2625      | 1313       | **95.8%**   |
+| VALU   | 6          | 7000      | 1167       | 85.2%       |
+| ALU    | 12         | 13926     | 1161       | 84.7%       |
+| Flow   | 1          | 289       | 289        | 21.1%       |
+| Store  | 2          | 64        | 32         | 2.3%        |
+
+**Bottleneck: LOAD engine at 95.8% utilization**
+
+Load slot utilization:
+- 2 loads (full): 1301 cycles (95.0%)
+- 1 load (half): 23 cycles (1.7%)
+- 0 loads: 46 cycles (3.4%)
+
+## Theoretical Minimum Analysis
+
+### Per-Round Structure (tree_depth=11, 16 rounds)
+
+**Load-bound rounds (levels 3-10, rounds 3-10,14-15): 10 rounds**
+- Load bottleneck: 256 load_offset / 2 = 128 cycles per round
+- Total: 10 × 128 = 1280 cycles
+
+**Cached rounds (levels 0-2, rounds 0-2,11-13): 6 rounds**
+- VALU bottleneck: ~416 ops / 6 = ~70 cycles per round
+- Total: 6 × 70 = 420 cycles
+
+**Round transitions**: 15 × ~4 = 60 cycles
+**Init + stores**: ~16 cycles
+
+**Theoretical minimum**: max(1296, 1167, 1161) + 76 = **~1372 cycles**
+**Current: 1370 — within 2 cycles of theoretical minimum!**
+
+## Path to Sub-1001
+
+Since we're at the theoretical minimum for the current op set, we must **reduce load ops** via tree level caching.
+
+| Level | Nodes | Rounds | Loads Saved | Cycles Saved |
+|-------|-------|--------|-------------|--------------|
+| 3     | 8     | 3, 14  | 512         | ~60-196      |
+| 4     | 16    | 4, 15  | 512         | ~60-196      |
+| 5     | 32    | 5      | 256         | ~30-98       |
+| **Total** | | | **1280** | **~150-490** |
+
+**Caching levels 3+4 → target ~978-1210 cycles**
+
+### Key Challenge: Scratch Space
+
+- Current usage: 1515 / 1536 (21 free)
+- Level 3 cache needs: ~64 words (8 vectors)
+- Level 4 cache needs: ~128 words (16 vectors)
+- **Solution**: Alias v_nv with cache vectors (v_nv only used levels 1,2; cache for 3,4)
+- v_nv[0..7] → level 3 cache, v_nv[8..23] → level 4 cache
+- Already moved load dest from v_nv to v_ad for levels 3+ (done)
+
+### Key Challenge: Selection Mechanism
+
+With 1 flow slot/cycle, vselect is expensive:
+- 8 values (level 3): 7 vselects × 32 elements = 224 flow cycles > 128 load cycles
+- Need alternative: staged pair selection, multiply_add mux, or hybrid approach
+- Research: 3-stage cascade may work (96 flow cycles, saving 32/round)
+
+---
+
+## Task List
+
+### Phase 1: Claude — Tasks 1-5 (Target: 1370→1250)
+
+- [x] Task 1: Move load_offset to v_ad for levels 3+ (done, 1370 maintained)
+- [ ] Task 2: Scratch aliasing — v_nv[0..7] ← level 3 cache vectors
+- [ ] Task 3: Level 3 cache with best available mux strategy
+- [ ] Task 4: Level 4 cache implementation
+- [ ] Task 5: Scheduler load packing (fill 23 half-empty load cycles)
+
+### Phase 2: Codex — Tasks 6-10
+
+- [ ] Task 6: Software pipelining across rounds
+- [ ] Task 7: Hash 3-op stage optimization (parallel ALU+VALU split)
+- [ ] Task 8: Store overlap with final round
+- [ ] Task 9: Level 5 cache (32 nodes, 1 round)
+- [ ] Task 10: ILP-based optimal scheduler prototype
+
+### Phase 3: Joint — Tasks 11-13
+
+- [ ] Task 11: Multi-round software pipelining with double buffering
+- [ ] Task 12: Speculative execution with double-load
+- [ ] Task 13: Cross-element hash interleaving
+
+---
+
+## Cross-Repository Issue Tracker
+
+### Applicable Issues
+
+| Source | Area | Relevance | Insight |
+|--------|------|-----------|---------|
+| nki-samples #69 | Instruction dependency | **HIGH** | WAR/RAW tracking patterns |
+| aws-neuron-sdk | VLIW scheduling | **HIGH** | Priority function design |
+| aws-neuron-sdk | Memory allocation | **HIGH** | Scratch aliasing strategies |
+| Xilinx/llvm-aie | Modulo scheduling | **HIGH** | Cross-round overlap |
+| llvm MachineScheduler | List scheduling | **HIGH** | Load-first heuristics |
+| llvm RegisterScavenger | Register reuse | **HIGH** | Lifetime-based aliasing |
+| NVIDIA CCCL | Architecture tuning | **MEDIUM** | Per-engine slot optimization |
+
+### Deleted (Not Applicable)
+- nki-samples #107 (FFT), #51 (attention), #81 (dropout), #67 (MaxPool2D)
+- nki-moe #15, #14 (administrative)
+
+---

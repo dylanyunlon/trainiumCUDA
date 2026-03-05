@@ -96,15 +96,12 @@ class KernelBuilder:
         tmp_init = self.alloc_scratch("tmp_init")
         # Only allocate and load vars actually used in the kernel body
         # rounds, n_nodes, batch_size, forest_height are NOT used (kernel is unrolled)
-        init_vars_unused = [
-            "rounds", "n_nodes", "batch_size", "forest_height",
-        ]
+        # Unused vars: don't allocate (saves 4 words of scratch space)
+        # init_vars_unused = ["rounds", "n_nodes", "batch_size", "forest_height"]
         init_vars_used = [
             "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
-        # Allocate unused vars as scratch space (can be reclaimed)
-        for v in init_vars_unused:
-            self.alloc_scratch(v, 1)
+        # (unused vars no longer allocated to save scratch space)
         for v in init_vars_used:
             self.alloc_scratch(v, 1)
         
@@ -253,30 +250,14 @@ class KernelBuilder:
         for i in range(4):
             body.append(("valu", ("vbroadcast", vlv2[i], lv2s[i])))
 
-        # --- Level 3 cache: 8 nodes (indices 7-14) ---
-        # Pre-load as scalars, broadcast to vectors, precompute pair differences
-        lv3s = [self.alloc_scratch(f"lv3s_{i}") for i in range(8)]
-        vlv3 = [self.alloc_scratch(f"vlv3_{i}", VLEN) for i in range(8)]
-        # Precomputed difference vectors for pairs: diff[i] = node[2i+1] - node[2i]
-        vlv3_diff = [self.alloc_scratch(f"vlv3d_{i}", VLEN) for i in range(4)]
-        
-        # Load 8 nodes. Compute addresses: forest_values_p + offset (7..14)
-        lv3_tmp = [self.alloc_scratch(f"lv3a_{i}") for i in range(8)]
-        for i in range(8):
-            sc = self.scratch_const(7 + i)
-            body.append(("alu", ("+", lv3_tmp[i], self.scratch["forest_values_p"], sc)))
-        for i in range(8):
-            body.append(("load", ("load", lv3s[i], lv3_tmp[i])))
-        for i in range(8):
-            body.append(("valu", ("vbroadcast", vlv3[i], lv3s[i])))
-        # Precompute pair diffs: diff[i] = vlv3[2i+1] - vlv3[2i]
-        for i in range(4):
-            body.append(("valu", ("-", vlv3_diff[i], vlv3[2*i+1], vlv3[2*i])))
+        # Precompute diff vectors for level 2 multiply_add selection
+        vlv2_diff_lo = self.alloc_scratch("vlv2_diff_lo", VLEN)
+        vlv2_diff_hi = self.alloc_scratch("vlv2_diff_hi", VLEN)
+        body.append(("valu", ("-", vlv2_diff_lo, vlv2[1], vlv2[0])))
+        body.append(("valu", ("-", vlv2_diff_hi, vlv2[3], vlv2[2])))
 
-        # Constant for level 3 offset
-        sc_seven = self.scratch_const(7)
-        v_seven = self.alloc_scratch("v_seven", VLEN)
-        body.append(("valu", ("vbroadcast", v_seven, sc_seven)))
+        # Level 3+ uses per-lane loads (deep level approach)
+        # Level 3 caching deferred until scratch space is freed via aliasing
 
         # --- Main loop ---
         for r in range(rounds):
@@ -298,19 +279,30 @@ class KernelBuilder:
                     for lane in range(VLEN):
                         body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
             elif level == 2:
+                # Level 2: 4 nodes. Use multiply_add to avoid flow bottleneck.
+                # select(bit, a, b) = b + bit * (a - b) = multiply_add(bit, diff, base)
                 for k in range(U):
+                    # offset = idx - 3 -> v_ad
                     body.append(("valu", ("-", v_ad[k], v_idx[k], v_three)))
-                    body.append(("valu", ("&", v_t1[k], v_ad[k], v_one)))
                 for k in range(U):
-                    body.append(("flow", ("vselect", v_t1[k], v_t1[k], vlv2[1], vlv2[0])))
-                for k in range(U):
+                    # bit0 = offset & 1 -> v_nv[k] (save in v_nv, NOT v_t1)
                     body.append(("valu", ("&", v_nv[k], v_ad[k], v_one)))
-                for k in range(U):
-                    body.append(("flow", ("vselect", v_nv[k], v_nv[k], vlv2[3], vlv2[2])))
-                for k in range(U):
+                    # bit1 = (offset >> 1) & 1 -> v_ad[k]
                     body.append(("valu", (">>", v_ad[k], v_ad[k], v_one)))
                 for k in range(U):
-                    body.append(("flow", ("vselect", v_nv[k], v_ad[k], v_nv[k], v_t1[k])))
+                    body.append(("valu", ("&", v_ad[k], v_ad[k], v_one)))
+                for k in range(U):
+                    # lo = vlv2[0] + bit0 * diff_lo -> v_t1[k]
+                    body.append(("valu", ("multiply_add", v_t1[k], v_nv[k], vlv2_diff_lo, vlv2[0])))
+                for k in range(U):
+                    # hi = vlv2[2] + bit0 * diff_hi -> v_nv[k] (overwrite bit0, no longer needed)
+                    body.append(("valu", ("multiply_add", v_nv[k], v_nv[k], vlv2_diff_hi, vlv2[2])))
+                for k in range(U):
+                    # (hi - lo) -> v_nv[k]
+                    body.append(("valu", ("-", v_nv[k], v_nv[k], v_t1[k])))
+                for k in range(U):
+                    # result = lo + bit1 * (hi - lo) -> v_nv[k]
+                    body.append(("valu", ("multiply_add", v_nv[k], v_ad[k], v_nv[k], v_t1[k])))
                 # XOR
                 for k in range(U):
                     for lane in range(VLEN):
@@ -514,12 +506,14 @@ class KernelBuilder:
         feeds_load = [0] * n
         for i in range(n):
             if ops[i][0] == 'load':
-                feeds_load[i] = 2
-        # Propagate backwards: if any successor feeds a load, mark this node too
+                feeds_load[i] = 3
+        # Propagate backwards with decreasing priority
         for node in reversed(topo):
             for succ in successors[node]:
-                if feeds_load[succ] > 0 and feeds_load[node] < 1:
-                    feeds_load[node] = 1
+                if feeds_load[succ] > 0:
+                    new_val = feeds_load[succ] - 1
+                    if new_val > feeds_load[node]:
+                        feeds_load[node] = new_val
 
         # Engine priority: load ops get highest priority (load is the bottleneck)
         engine_priority = {"load": 0, "store": 1, "flow": 2, "valu": 3, "alu": 4}
@@ -531,30 +525,28 @@ class KernelBuilder:
                 if ops[succ][0] == 'load':
                     load_succ_count[i] += 1
 
-        # Sort by: critical path (desc), load-feeder (desc), engine priority (load first), mobility (asc), original order
-        max_crit = max(crit) if crit else 0
-        sorted_ops = sorted(range(n), key=lambda i: (
-            -crit[i],
-            -feeds_load[i],
-            -load_succ_count[i],
-            engine_priority.get(ops[i][0], 5),
-            -(max_crit - crit[i] - earliest[i]),  # negative mobility = less flexible = schedule first
-            i
-        ))
-
+        # TWO-PHASE SCHEDULER:
+        # Phase 1: Schedule loads and their direct predecessors to ASAP times
+        # Phase 2: Fill remaining compute operations around the load schedule
+        
         schedule = defaultdict(list)
         res_usage = defaultdict(lambda: defaultdict(int))
         reg_avail = defaultdict(int)
         reg_last_rd = defaultdict(int)
         reg_last_wr = {}
         op_time = {}
+        scheduled = set()
 
         slot_limits = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1}
 
-        for idx in sorted_ops:
+        def schedule_op(idx):
+            if idx in scheduled:
+                return
             eng, slot, rd, wr = ops[idx]
             t_min = 0
             for pred, dtype in predecessors[idx].items():
+                if pred not in op_time:
+                    schedule_op(pred)  # Recursively schedule predecessors
                 pt = op_time[pred]
                 if dtype == 'war':
                     if pt > t_min: t_min = pt
@@ -573,19 +565,48 @@ class KernelBuilder:
             t = t_min
             while res_usage[t][eng] >= slot_limits[eng]:
                 t += 1
-            # Heuristic: delay VALU ops when they'd crowd out load scheduling
-            if eng == 'valu' and res_usage[t]['load'] < 2 and res_usage[t]['valu'] >= 5:
-                if res_usage[t+1]['valu'] < slot_limits['valu']:
-                    t += 1
             schedule[t].append((eng, slot))
             res_usage[t][eng] += 1
             op_time[idx] = t
+            scheduled.add(idx)
             for r in wr:
                 reg_avail[r] = t + 1
                 reg_last_wr[r] = t
             for r in rd:
                 cur = reg_last_rd.get(r, 0)
                 if t > cur: reg_last_rd[r] = t
+
+        # Phase 1: Schedule all load ops and store ops first (priority order)
+        load_store_ops = sorted(
+            [i for i in range(n) if ops[i][0] in ('load', 'store')],
+            key=lambda i: (-crit[i], earliest[i], i)
+        )
+        for idx in load_store_ops:
+            schedule_op(idx)
+
+        # Phase 2: Schedule flow ops
+        flow_ops = sorted(
+            [i for i in range(n) if ops[i][0] == 'flow' and i not in scheduled],
+            key=lambda i: (-crit[i], earliest[i], i)
+        )
+        for idx in flow_ops:
+            schedule_op(idx)
+
+        # Phase 3: Schedule remaining compute ops (VALU first, then ALU)
+        # Sort by: critical path, then load-feeder score, then engine priority
+        remaining = sorted(
+            [i for i in range(n) if i not in scheduled],
+            key=lambda i: (
+                -crit[i],
+                -feeds_load[i],
+                -load_succ_count[i],
+                engine_priority.get(ops[i][0], 5),
+                earliest[i],
+                i
+            )
+        )
+        for idx in remaining:
+            schedule_op(idx)
 
         if schedule:
             max_t = max(schedule.keys())

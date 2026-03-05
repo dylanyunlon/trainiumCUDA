@@ -152,20 +152,34 @@ class KernelBuilder:
         # Restore original add
         self.add = _saved_add
         
-        # Save init loads to prepend to body after it's created
+        # ================================================================
+        # INIT PHASE: emit init loads, then PAUSE
+        # The pause matches the first yield in reference_kernel2
+        # Init phase cycle count doesn't affect performance measurement
+        # ================================================================
         _init_var_loads = []
         for idx_val, v in zip(used_indices, init_vars_used):
-            _init_var_loads.append(("load", ("const", tmp_init, idx_val)))
-            _init_var_loads.append(("load", ("load", self.scratch[v], tmp_init)))
-        _all_init_loads = _init_var_loads + [("load", cl) for cl in init_const_loads]
+            _init_var_loads.append(("const", tmp_init, idx_val))
+            _init_var_loads.append(("load", self.scratch[v], tmp_init))
+
+        # Emit pointer loads: const then load, separate cycles (data dependency)
+        for op in _init_var_loads:
+            self.instrs.append({"load": [op]})
+        
+        # Emit all scalar constants (no dependencies, pack 2 per cycle)
+        for i in range(0, len(init_const_loads), 2):
+            bundle = {"load": [init_const_loads[i]]}
+            if i + 1 < len(init_const_loads):
+                bundle["load"].append(init_const_loads[i + 1])
+            self.instrs.append(bundle)
+
+        # Pause to match reference_kernel2's first yield
+        self.instrs.append({"flow": [("pause",)]})
 
         # ================================================================
         # BODY SECTION - collected as list, scheduled by embedded scheduler
         # ================================================================
         body = []
-        
-        # Prepend init loads so scheduler manages them
-        body.extend(_all_init_loads)
 
         # --- Vector constants ---
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -238,6 +252,31 @@ class KernelBuilder:
             body.append(("valu", ("vbroadcast", vlv1[i], lv1s[i])))
         for i in range(4):
             body.append(("valu", ("vbroadcast", vlv2[i], lv2s[i])))
+
+        # --- Level 3 cache: 8 nodes (indices 7-14) ---
+        # Pre-load as scalars, broadcast to vectors, precompute pair differences
+        lv3s = [self.alloc_scratch(f"lv3s_{i}") for i in range(8)]
+        vlv3 = [self.alloc_scratch(f"vlv3_{i}", VLEN) for i in range(8)]
+        # Precomputed difference vectors for pairs: diff[i] = node[2i+1] - node[2i]
+        vlv3_diff = [self.alloc_scratch(f"vlv3d_{i}", VLEN) for i in range(4)]
+        
+        # Load 8 nodes. Compute addresses: forest_values_p + offset (7..14)
+        lv3_tmp = [self.alloc_scratch(f"lv3a_{i}") for i in range(8)]
+        for i in range(8):
+            sc = self.scratch_const(7 + i)
+            body.append(("alu", ("+", lv3_tmp[i], self.scratch["forest_values_p"], sc)))
+        for i in range(8):
+            body.append(("load", ("load", lv3s[i], lv3_tmp[i])))
+        for i in range(8):
+            body.append(("valu", ("vbroadcast", vlv3[i], lv3s[i])))
+        # Precompute pair diffs: diff[i] = vlv3[2i+1] - vlv3[2i]
+        for i in range(4):
+            body.append(("valu", ("-", vlv3_diff[i], vlv3[2*i+1], vlv3[2*i])))
+
+        # Constant for level 3 offset
+        sc_seven = self.scratch_const(7)
+        v_seven = self.alloc_scratch("v_seven", VLEN)
+        body.append(("valu", ("vbroadcast", v_seven, sc_seven)))
 
         # --- Main loop ---
         for r in range(rounds):

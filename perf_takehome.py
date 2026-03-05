@@ -94,17 +94,25 @@ class KernelBuilder:
         # INIT SECTION - collect all init loads, then pack 2 per cycle
         # ================================================================
         tmp_init = self.alloc_scratch("tmp_init")
-        init_vars = [
+        # Only allocate and load vars actually used in the kernel body
+        # rounds, n_nodes, batch_size, forest_height are NOT used (kernel is unrolled)
+        init_vars_unused = [
             "rounds", "n_nodes", "batch_size", "forest_height",
+        ]
+        init_vars_used = [
             "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
-        for v in init_vars:
+        # Allocate unused vars as scratch space (can be reclaimed)
+        for v in init_vars_unused:
+            self.alloc_scratch(v, 1)
+        for v in init_vars_used:
             self.alloc_scratch(v, 1)
         
-        # Collect init loads instead of emitting them one at a time
+        # Only generate loads for the 3 used vars (indices 4,5,6 in mem header)
         init_loads = []
-        for i, v in enumerate(init_vars):
-            init_loads.append(("const", tmp_init, i))
+        used_indices = [4, 5, 6]  # forest_values_p=mem[4], inp_indices_p=mem[5], inp_values_p=mem[6]
+        for idx_val, v in zip(used_indices, init_vars_used):
+            init_loads.append(("const", tmp_init, idx_val))
             init_loads.append(("load", self.scratch[v], tmp_init))
 
         # Override scratch_const to collect instead of emit
@@ -146,8 +154,8 @@ class KernelBuilder:
         
         # Save init loads to prepend to body after it's created
         _init_var_loads = []
-        for i, v in enumerate(init_vars):
-            _init_var_loads.append(("load", ("const", tmp_init, i)))
+        for idx_val, v in zip(used_indices, init_vars_used):
+            _init_var_loads.append(("load", ("const", tmp_init, idx_val)))
             _init_var_loads.append(("load", ("load", self.scratch[v], tmp_init)))
         _all_init_loads = _init_var_loads + [("load", cl) for cl in init_const_loads]
 
@@ -188,17 +196,19 @@ class KernelBuilder:
         v_ad  = [self.alloc_scratch(f"va_{k}", VLEN) for k in range(U)]
 
         st = self.alloc_scratch("st")
-        st2 = self.alloc_scratch("st2")
         v_offset = self.alloc_scratch("v_offset")
 
         # --- Load initial idx and val vectors ---
-        # Compute idx and val addresses simultaneously using separate temporaries
+        # Initial indices are ALL ZERO (see Input.generate), so copy from v_zero
+        # instead of loading from memory. This saves 32 vload ops.
+        for k in range(U):
+            body.append(("valu", ("+", v_idx[k], v_zero, v_zero)))
+
+        # Load initial values from memory (these are random, must load)
         body.append(("load", ("const", v_offset, 0)))
         for k in range(U):
-            body.append(("alu", ("+", st, self.scratch["inp_indices_p"], v_offset)))
-            body.append(("alu", ("+", st2, self.scratch["inp_values_p"], v_offset)))
-            body.append(("load", ("vload", v_idx[k], st)))
-            body.append(("load", ("vload", v_val[k], st2)))
+            body.append(("alu", ("+", st, self.scratch["inp_values_p"], v_offset)))
+            body.append(("load", ("vload", v_val[k], st)))
             if k < U - 1:
                 body.append(("alu", ("+", v_offset, v_offset, vlen_const)))
 
@@ -235,15 +245,21 @@ class KernelBuilder:
         for r in range(rounds):
             level = r % TREE_DEPTH
 
-            # STAGE 1: NODE VALUE LOOKUP
+            # STAGE 1+2 COMBINED: NODE VALUE LOOKUP + XOR
             if level == 0:
+                # Level 0: root value is cached in vlv0. XOR directly, skip v_nv copy.
                 for k in range(U):
-                    body.append(("valu", ("+", v_nv[k], vlv0, v_zero)))
+                    for lane in range(VLEN):
+                        body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, vlv0+lane)))
             elif level == 1:
                 for k in range(U):
                     body.append(("valu", ("-", v_ad[k], v_idx[k], v_one)))
                 for k in range(U):
                     body.append(("flow", ("vselect", v_nv[k], v_ad[k], vlv1[1], vlv1[0])))
+                # XOR
+                for k in range(U):
+                    for lane in range(VLEN):
+                        body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
             elif level == 2:
                 for k in range(U):
                     body.append(("valu", ("-", v_ad[k], v_idx[k], v_three)))
@@ -255,23 +271,32 @@ class KernelBuilder:
                 for k in range(U):
                     body.append(("flow", ("vselect", v_nv[k], v_nv[k], vlv2[3], vlv2[2])))
                 for k in range(U):
-                    # v_ad was 0-3, so >>1 yields 0 or 1; &1 is redundant
                     body.append(("valu", (">>", v_ad[k], v_ad[k], v_one)))
                 for k in range(U):
                     body.append(("flow", ("vselect", v_nv[k], v_ad[k], v_nv[k], v_t1[k])))
+                # XOR
+                for k in range(U):
+                    for lane in range(VLEN):
+                        body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
             else:
                 for k in range(U):
                     body.append(("valu", ("+", v_ad[k], v_forest_p, v_idx[k])))
                 for k in range(U):
                     for lane in range(VLEN):
                         body.append(("load", ("load_offset", v_nv[k], v_ad[k], lane)))
+                # XOR
+                for k in range(U):
+                    for lane in range(VLEN):
+                        body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
 
-            # STAGE 2: XOR via scalar ALU
-            for k in range(U):
-                for lane in range(VLEN):
-                    body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
+            # STAGE 3: HASH (with speculative idx precomputation overlapping)
+            # Phase 1 of idx update: v_idx = v_idx*2+1 (independent of hash result)
+            # Emitted BEFORE hash so the scheduler can overlap them.
+            # NOTE: We do NOT precompute v_ad here because 3-op hash stages use v_ad as temp.
+            if level + 1 < TREE_DEPTH:
+                for k in range(U):
+                    body.append(("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one)))
 
-            # STAGE 3: HASH
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 stype, c1, c2 = v_hash_consts[hi]
                 if stype == "multiply_add":
@@ -283,13 +308,12 @@ class KernelBuilder:
                         body.append(("valu", (op3, v_ad[k], v_val[k], c2)))
                         body.append(("valu", (op2, v_val[k], v_t1[k], v_ad[k])))
 
-            # STAGE 4: IDX UPDATE
+            # STAGE 4: IDX UPDATE (Phase 2 - apply hash bit correction)
             if level + 1 >= TREE_DEPTH:
                 for k in range(U):
                     body.append(("valu", ("+", v_idx[k], v_zero, v_zero)))
             else:
-                for k in range(U):
-                    body.append(("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one)))
+                # Phase 2: v_idx += (v_val & 1) -- depends on hash result
                 for k in range(U):
                     for lane in range(VLEN):
                         body.append(("alu", ("&", v_t1[k]+lane, v_val[k]+lane, v_one)))
@@ -431,7 +455,29 @@ class KernelBuilder:
                 if c > mx: mx = c
             crit[node] = mx
 
-        sorted_ops = sorted(range(n), key=lambda i: (-crit[i], i))
+        # Compute earliest start (forward ASAP)
+        earliest = [0] * n
+        for node in topo:
+            es = 0
+            for pred, dtype in predecessors[node].items():
+                ep = earliest[pred]
+                if dtype == 'war':
+                    if ep > es: es = ep
+                else:
+                    if ep + 1 > es: es = ep + 1
+            earliest[node] = es
+
+        # Engine priority: load ops get highest priority (load is the bottleneck)
+        engine_priority = {"load": 0, "store": 1, "flow": 2, "valu": 3, "alu": 4}
+
+        # Sort by: critical path (desc), then engine priority (load first), then mobility (asc), then original order
+        max_crit = max(crit) if crit else 0
+        sorted_ops = sorted(range(n), key=lambda i: (
+            -crit[i],
+            engine_priority.get(ops[i][0], 5),
+            -(max_crit - crit[i] - earliest[i]),  # negative mobility = less flexible = schedule first
+            i
+        ))
 
         schedule = defaultdict(list)
         res_usage = defaultdict(lambda: defaultdict(int))

@@ -293,7 +293,9 @@ class KernelBuilder:
             # Phase 1 of idx update: v_idx = v_idx*2+1 (independent of hash result)
             # Emitted BEFORE hash so the scheduler can overlap them.
             # NOTE: We do NOT precompute v_ad here because 3-op hash stages use v_ad as temp.
-            if level + 1 < TREE_DEPTH:
+            # Skip idx update entirely for last round (idx not needed after)
+            is_last_round = (r == rounds - 1)
+            if not is_last_round and level + 1 < TREE_DEPTH:
                 for k in range(U):
                     body.append(("valu", ("multiply_add", v_idx[k], v_idx[k], v_two, v_one)))
 
@@ -309,7 +311,9 @@ class KernelBuilder:
                         body.append(("valu", (op2, v_val[k], v_t1[k], v_ad[k])))
 
             # STAGE 4: IDX UPDATE (Phase 2 - apply hash bit correction)
-            if level + 1 >= TREE_DEPTH:
+            if is_last_round:
+                pass  # Skip idx update for last round - v_idx not needed after this
+            elif level + 1 >= TREE_DEPTH:
                 for k in range(U):
                     body.append(("valu", ("+", v_idx[k], v_zero, v_zero)))
             else:

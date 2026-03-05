@@ -205,12 +205,10 @@ class KernelBuilder:
             body.append(("valu", ("+", v_idx[k], v_zero, v_zero)))
 
         # Load initial values from memory (these are random, must load)
-        body.append(("load", ("const", v_offset, 0)))
+        # Use flow:add_imm for independent address computation (no serial chain)
         for k in range(U):
-            body.append(("alu", ("+", st, self.scratch["inp_values_p"], v_offset)))
+            body.append(("flow", ("add_imm", st, self.scratch["inp_values_p"], k * VLEN)))
             body.append(("load", ("vload", v_val[k], st)))
-            if k < U - 1:
-                body.append(("alu", ("+", v_offset, v_offset, vlen_const)))
 
         # --- Level cache: pre-load and broadcast levels 0, 1, 2 ---
         lv0 = self.alloc_scratch("lv0")
@@ -467,13 +465,32 @@ class KernelBuilder:
                     if ep + 1 > es: es = ep + 1
             earliest[node] = es
 
+        # Compute load-feeder score: ops that transitively feed into loads get priority
+        feeds_load = [0] * n
+        for i in range(n):
+            if ops[i][0] == 'load':
+                feeds_load[i] = 2
+        # Propagate backwards: if any successor feeds a load, mark this node too
+        for node in reversed(topo):
+            for succ in successors[node]:
+                if feeds_load[succ] > 0 and feeds_load[node] < 1:
+                    feeds_load[node] = 1
+
         # Engine priority: load ops get highest priority (load is the bottleneck)
         engine_priority = {"load": 0, "store": 1, "flow": 2, "valu": 3, "alu": 4}
 
-        # Sort by: critical path (desc), then engine priority (load first), then mobility (asc), then original order
+        # Compute number of load successors for each op (direct only)
+        load_succ_count = [0] * n
+        for i in range(n):
+            for succ in successors[i]:
+                if ops[succ][0] == 'load':
+                    load_succ_count[i] += 1
+
+        # Sort by: critical path (desc), load-feeder (desc), engine priority (load first), mobility (asc), original order
         max_crit = max(crit) if crit else 0
         sorted_ops = sorted(range(n), key=lambda i: (
             -crit[i],
+            -load_succ_count[i],
             engine_priority.get(ops[i][0], 5),
             -(max_crit - crit[i] - earliest[i]),  # negative mobility = less flexible = schedule first
             i
@@ -510,6 +527,16 @@ class KernelBuilder:
             t = t_min
             while res_usage[t][eng] >= slot_limits[eng]:
                 t += 1
+            # For non-load, non-store ops: if scheduling at t would create a
+            # 1-load cycle (cycle t has 1 load), prefer to delay by 1 if the
+            # next cycle has 2 loads (already full) AND has capacity for this engine.
+            # This avoids splitting load pairs across cycles.
+            if eng not in ('load', 'store') and t_min == t:
+                if res_usage[t]['load'] == 1 and res_usage[t][eng] < slot_limits[eng]:
+                    # Check if delaying to t+1 would be OK (has capacity)
+                    if (t + 1 not in op_time.values() or True) and res_usage[t+1][eng] < slot_limits[eng]:
+                        # Only delay if it doesn't push us past a load-heavy zone
+                        pass  # Don't delay - this heuristic needs more careful analysis
             schedule[t].append((eng, slot))
             res_usage[t][eng] += 1
             op_time[idx] = t

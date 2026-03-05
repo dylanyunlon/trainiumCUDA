@@ -9,14 +9,228 @@
 
 ## Architecture Bottleneck Analysis
 
-### Resource Utilization (1370 cycles)
-| Engine | Total Ops | Per-Cycle Limit | Min Cycles | Avg Utilization |
-|--------|-----------|-----------------|------------|-----------------|
-| LOAD   | 2625      | 2               | **1313**   | 95.8%           |
-| VALU   | 7000      | 6               | 1167       | 85.2%           |
-| ALU    | 13926     | 12              | 1161       | 84.7%           |
-| FLOW   | 289       | 1               | 289        | 21.1%           |
-| STORE  | 64        | 2               | 32         | 4.7%            |
+# Performance Optimization Plan: trainiumCUDA → Sub-1001 Cycles
+
+## Current Status: 1370 cycles (107.8x speedup over 147,734 baseline)
+
+### Critical Path Analysis
+
+The kernel is **95.8% load-bound**:
+- Load engine: 2625 ops, active 1301/1370 cycles at max capacity (2/2)
+- VALU engine: 7000 ops, 85.2% utilization  
+- ALU engine: 13926 ops, 84.7% utilization
+- Flow engine: 289 ops, 21.1% utilization
+- Store engine: 64 ops, 2.3% utilization
+
+**To reach 1001 cycles, we must eliminate ~738 load operations (369 load-cycles).**
+
+---
+
+## Architecture Summary
+
+| Engine | Slots/Cycle | Current Utilization | Status |
+|--------|------------|-------------------|--------|
+| ALU    | 12         | 84.7%             | Supporting |
+| VALU   | 6          | 85.2%             | Near-saturated |
+| Load   | 2          | **95.8%**         | **BOTTLENECK** |
+| Store  | 2          | 2.3%              | Idle |
+| Flow   | 1          | 21.1%             | Available |
+
+### Per-Round Analysis (16 rounds, tree_depth=11)
+
+| Round | Level | Load Ops | Load Cycles | VALU Cycles | Bottleneck |
+|-------|-------|----------|-------------|-------------|------------|
+| 0,11  | 0     | 0        | 0           | ~70         | VALU       |
+| 1,12  | 1     | 0        | 0           | ~75         | VALU+Flow  |
+| 2,13  | 2     | 0        | 0           | ~96         | VALU+Flow  |
+| 3,14  | 3     | 256      | 128         | ~70         | **LOAD**   |
+| 4,15  | 4     | 256      | 128         | ~70         | **LOAD**   |
+| 5     | 5     | 256      | 128         | ~70         | **LOAD**   |
+| 6     | 6     | 256      | 128         | ~70         | **LOAD**   |
+| 7     | 7     | 256      | 128         | ~70         | **LOAD**   |
+| 8     | 8     | 256      | 128         | ~70         | **LOAD**   |
+| 9     | 9     | 256      | 128         | ~70         | **LOAD**   |
+| 10    | 10    | 256      | 128         | ~64         | **LOAD**   |
+
+---
+
+## Optimization Approaches (Ordered by Impact)
+
+### TIER 1: Critical (Required for sub-1001)
+
+#### 1. [P0] Cache Tree Level 3 — Save ~94 cycles
+**Status: BLOCKED by scratch space (need 64 words, have 21 free)**
+- Level 3 has only 8 nodes, appears in rounds 3,14
+- Cache 8 scalar values at init, broadcast to 8 vectors
+- Eliminates 512 load ops (256 per round × 2 rounds)
+- Each round becomes VALU-bound (~70 cy) instead of load-bound (128 cy)
+- Net savings: (128-70) × 2 = ~116 cycles minus vselect overhead
+- **Prerequisite**: Free scratch via approach #5
+
+#### 2. [P0] Cache Tree Level 4 — Save ~94 cycles  
+**Status: BLOCKED by scratch space (need 128 words)**
+- Level 4 has 16 nodes, appears in rounds 4,15
+- Same approach as level 3 but with 4-level binary vselect
+- **Prerequisite**: Free scratch via approach #5
+
+#### 3. [P0] Cache Tree Level 5 — Save ~47 cycles
+**Status: BLOCKED by scratch space (need 256 words)**
+- Level 5 has 32 nodes, appears in round 5 only
+- **Prerequisite**: Free scratch via approach #5
+
+#### 4. [P0] Eliminate vselect Overhead for Cached Levels
+- For level 3 (8 nodes): binary search needs 7 vselects × 32 = 224 flow cycles
+- This is WORSE than 128 load cycles!
+- **Solution**: Use multiply_add branchless mux chains (algebraic selection)
+- For 8 nodes: 3 stages × ~5 VALU = 15 VALU × 32 = 480 ops = 80 cycles
+- For 16 nodes: 4 stages ≈ 100 cycles  
+- Must balance VALU pressure vs flow availability
+
+#### 5. [P0] Free Scratch Space — Enable levels 3-5 caching
+**Options (pick combination):**
+- a) Alias v_nv with v_t1 for levels 3+ (save 256 words) — Complex, level 2 conflicts
+- b) Process in 2 halves (U=16 per half, loop) — Save 640 words but 2x overhead
+- c) Reduce U to 24 (3 passes of 8 vectors) — Save 320 words  
+- d) Store v_nv values directly in v_ad after addr compute (save 256 words)
+- e) Remove unused scratch allocations — Save 4 words (already identified)
+- f) Reuse lv_addr after init — Save 7 words
+- g) Compact scalar constants — Share with unused var space
+
+### TIER 2: Important (Required for competitive submission)
+
+#### 6. [P1] Improve Scheduler Load Packing
+- 69 cycles currently have <2 loads (wasted bandwidth)
+- Improve priority heuristic to always maximize load fill
+- Target: save 20-40 cycles
+
+#### 7. [P1] Software Pipelining Across Rounds
+- Overlap hash computation of round N with loads of round N+1
+- Challenge: round N+1's addresses depend on round N's hash result
+- Speculative approach: precompute v_idx*2+1 before hash completes
+- Then only need 1 correction bit after hash → overlap most of addr computation
+
+#### 8. [P1] Convert Level 0 XOR to VALU
+- Currently 256 per-lane ALU ops for XOR with cached root value
+- Could be 32 VALU ops — saves 16 cycles per level 0 round
+- Risk: adds VALU pressure on non-load-bound rounds
+- **Only beneficial if VALU has spare capacity** (check per-round)
+
+### TIER 3: Nice to Have
+
+#### 9. [P2] Store Optimization — vstore Batching
+- Currently 64 store ops at end
+- Can overlap stores with final hash computations
+
+#### 10. [P2] Init Phase Optimization  
+- Better packing of constant loads and broadcasts during init
+
+---
+
+## Issue Tracker: Related Compiler/SDK Problems
+
+### From aws-neuron/nki-samples
+| # | Issue | Our Relevance | Status |
+|---|-------|--------------|--------|
+| 72 | Python call stack overhead in kernel construction | Build-time optimization, not runtime | Low |
+| 69 | Wrong instruction dependency | **CRITICAL**: Same class of dep tracking bugs in our scheduler | High |
+| 51 | Fused attention errors with randn | Numeric precision in fused ops | Low |
+| 36 | MatMul result/store semantics | Memory layout for tile operations | Medium |
+
+### From aws-neuron/aws-neuron-sdk
+| # | Issue | Our Relevance | Status |
+|---|-------|--------------|--------|
+| 1015 | Error benchmarking auto-generated NKI | Benchmark methodology | Low |
+| - | VLIW instruction scheduling passes | Direct analog to our scheduler | High |
+| - | Memory allocation optimization | Scratch space management ≈ SBUF allocation | High |
+
+### From Xilinx/llvm-aie (AIEngine LLVM)
+| Area | Relevance | Transferable Insight |
+|------|-----------|---------------------|
+| VLIW scheduling | Direct analog: AIEngine uses VLIW | Priority functions, resource balancing |
+| Software pipelining | Modulo scheduling for loops | Cross-round overlap techniques |
+| Register allocation | Scratch = register file | Aliasing, spilling strategies |
+
+### From llvm/llvm-project
+| Area | Relevance | Transferable Insight |
+|------|-----------|---------------------|
+| MachineScheduler | List scheduling with priority | Better heuristics for our scheduler |
+| ModuloScheduler | Software pipelining | Cross-iteration overlap |
+| RegisterScavenger | Register reuse | Scratch space aliasing/reuse |
+| PostRAScheduler | Post-allocation scheduling | Schedule after scratch allocation |
+
+### From NVIDIA CCCL / GPU MODE
+| Insight | Transferable to Our Problem |
+|---------|----------------------------|
+| CUB sort uses architecture-tuned policies | Our scheduler should tune to slot limits |
+| Vectorized memory access patterns | Maximize vload where possible |
+| Warp-level primitives for reduction | Vector-level reduction in hash |
+
+---
+
+## Task List for Implementation
+
+### Phase 1: Scratch Space Recovery (Claude)
+- [ ] Task 1: Remove unused var allocations (rounds, n_nodes, etc.) — Save 4 words
+- [ ] Task 2: Reuse lv_addr after init loads — Save 7 words
+- [ ] Task 3: Alias v_nv with v_ad for levels 3+ — Save 256 words
+- [ ] Task 4: Compact scalar constants into freed space
+- [ ] Task 5: Verify scratch usage fits with level 3 cache (64 words needed)
+
+### Phase 2: Level 3-4 Caching (Claude)
+- [ ] Task 6: Implement level 3 cache (8 nodes, scalar load + broadcast)
+- [ ] Task 7: Implement branchless mux for level 3 (multiply_add chain)
+- [ ] Task 8: Test and verify correctness with level 3 cache
+- [ ] Task 9: Implement level 4 cache if scratch allows (16 nodes)
+- [ ] Task 10: Benchmark after level caching
+
+### Phase 3: Scheduler Improvements (Codex)
+- [ ] Task 11: Profile per-cycle load utilization gaps
+- [ ] Task 12: Improve load-feeder priority to reduce gaps
+- [ ] Task 13: Implement speculative addr precomputation for next round
+- [ ] Task 14: Add inter-round dependency analysis to scheduler
+- [ ] Task 15: Test cross-round software pipelining
+
+### Phase 4: Micro-optimizations (Codex)
+- [ ] Task 16: Convert level 0 XOR to VALU (if VALU has capacity)
+- [ ] Task 17: Optimize store phase overlap
+- [ ] Task 18: Reduce init phase cycles
+- [ ] Task 19: Fine-tune scheduler priority weights
+- [ ] Task 20: Final benchmark and validation
+
+---
+
+## Theoretical Limits
+
+With perfect scheduling and level 3-5 caching:
+- Non-load rounds (0-5, 11-15): 11 rounds × ~70 VALU cycles = 770 cycles
+- Load rounds (6-10): 5 rounds × 128 load cycles = 640 cycles  
+- Overlap between rounds: ~200 cycles (hash under load shadow)
+- Store + init overhead: ~30 cycles
+- **Theoretical minimum: ~970 cycles** (with perfect overlap)
+- **Practical target: ~1050-1100 cycles**
+
+To actually reach sub-1001 requires either:
+1. Caching level 5+ (eliminates more load rounds), OR
+2. Processing in 2 halves with smaller U, OR
+3. Fundamentally reducing loads via memory layout changes
+
+---
+
+## Git Commit Strategy
+
+Each optimization phase should be a separate commit:
+```
+feat: phase-1 scratch-recovery - free 267 words via aliasing
+feat: phase-2 level3-cache - cache 8 tree nodes, save ~94 cycles  
+feat: phase-2 level4-cache - cache 16 tree nodes, save ~94 cycles
+feat: phase-3 scheduler-improve - better load packing heuristics
+feat: phase-4 micro-opts - XOR to VALU, store overlap
+```
+
+PR description should include:
+- Before/after cycle count
+- `git diff origin/main tests/` output (must be empty)
+- `python tests/submission_tests.py` output
 
 ### Critical Finding
 **LOAD engine is the bottleneck** at 1313 minimum cycles. Current 1370 is only 57 cycles above this floor. The deep levels (3-10) consume 256 loads per round × 10 deep rounds = 2560 loads, 97% of total.

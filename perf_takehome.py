@@ -277,8 +277,10 @@ class KernelBuilder:
                     for lane in range(VLEN):
                         body.append(("alu", ("^", v_val[k]+lane, v_val[k]+lane, v_nv[k]+lane)))
             else:
+                # Level 3+: use per-lane ALU for address computation to reduce VALU pressure
                 for k in range(U):
-                    body.append(("valu", ("+", v_ad[k], v_forest_p, v_idx[k])))
+                    for lane in range(VLEN):
+                        body.append(("alu", ("+", v_ad[k]+lane, v_forest_p+lane, v_idx[k]+lane)))
                 for k in range(U):
                     for lane in range(VLEN):
                         body.append(("load", ("load_offset", v_nv[k], v_ad[k], lane)))
@@ -490,6 +492,7 @@ class KernelBuilder:
         max_crit = max(crit) if crit else 0
         sorted_ops = sorted(range(n), key=lambda i: (
             -crit[i],
+            -feeds_load[i],
             -load_succ_count[i],
             engine_priority.get(ops[i][0], 5),
             -(max_crit - crit[i] - earliest[i]),  # negative mobility = less flexible = schedule first
@@ -527,16 +530,10 @@ class KernelBuilder:
             t = t_min
             while res_usage[t][eng] >= slot_limits[eng]:
                 t += 1
-            # For non-load, non-store ops: if scheduling at t would create a
-            # 1-load cycle (cycle t has 1 load), prefer to delay by 1 if the
-            # next cycle has 2 loads (already full) AND has capacity for this engine.
-            # This avoids splitting load pairs across cycles.
-            if eng not in ('load', 'store') and t_min == t:
-                if res_usage[t]['load'] == 1 and res_usage[t][eng] < slot_limits[eng]:
-                    # Check if delaying to t+1 would be OK (has capacity)
-                    if (t + 1 not in op_time.values() or True) and res_usage[t+1][eng] < slot_limits[eng]:
-                        # Only delay if it doesn't push us past a load-heavy zone
-                        pass  # Don't delay - this heuristic needs more careful analysis
+            # Heuristic: delay VALU ops when they'd crowd out load scheduling
+            if eng == 'valu' and res_usage[t]['load'] < 2 and res_usage[t]['valu'] >= 5:
+                if res_usage[t+1]['valu'] < slot_limits['valu']:
+                    t += 1
             schedule[t].append((eng, slot))
             res_usage[t][eng] += 1
             op_time[idx] = t
